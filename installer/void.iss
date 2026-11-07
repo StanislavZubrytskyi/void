@@ -25,11 +25,23 @@ CloseApplications=yes
 CloseApplicationsFilter=void.exe
 LicenseFile=..\LICENSE
 
+; The first language is the fallback: Inno Setup picks the entry matching the Windows UI
+; language, and uses the first one listed when none matches. English therefore comes first.
 [Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "ukrainian"; MessagesFile: "compiler:Languages\Ukrainian.isl"
+Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
+
+[CustomMessages]
+english.AutoStart=Start Void with Windows
+ukrainian.AutoStart=Запускати Void разом з Windows
+russian.AutoStart=Запускать Void вместе с Windows
+english.LaunchVoid=Launch Void
+ukrainian.LaunchVoid=Запустити Void
+russian.LaunchVoid=Запустить Void
 
 [Tasks]
-Name: "autostart"; Description: "Запускати Void разом з Windows"; Flags: unchecked
+Name: "autostart"; Description: "{cm:AutoStart}"; Flags: unchecked
 
 [Files]
 Source: "..\target\release\void.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -50,4 +62,4 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM void.exe"; Flags: runhidden 
 [Run]
 ; Підключає status line Claude Code, зберігаючи попередній. Нічого не треба налаштовувати вручну.
 Filename: "{app}\void.exe"; Parameters: "connect-statusline"; Flags: runhidden waituntilterminated
-Filename: "{app}\void.exe"; Description: "Запустити Void"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\void.exe"; Description: "{cm:LaunchVoid}"; Flags: nowait postinstall skipifsilent

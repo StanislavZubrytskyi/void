@@ -1,64 +1,97 @@
-//! A short melodic chime when an agent finishes a turn: a warm marimba arpeggio for Claude,
-//! a bright glassy bell motif for Codex, both with a touch of room reverb. Synthesized once
-//! into an in-memory WAV, so nothing ships as an asset.
+//! A cat's meow when an agent finishes a turn: a voiced source whose pitch glides up and down,
+//! shaped by two resonances so it sounds like a vowel. Claude's is a long, drawn-out "мяяу";
+//! Codex's is a short, brighter "мяу!". Synthesized once into an in-memory WAV, so nothing ships
+//! as an asset.
 
 use std::{f32::consts::TAU, sync::OnceLock};
 
 const RATE: u32 = 22_050;
-const LENGTH: f32 = 1.25;
 
-/// One instrument voice: FM synthesis, the modulator at `ratio` times the note, its
-/// brightness fading faster than the note itself.
-struct Voice {
-    ratio: f32,
+/// One meow: a pitch contour through `pitch` (Hz at the start, the peak, and the end), a total
+/// length, and the two vowel resonances.
+struct Meow {
+    seconds: f32,
+    pitch: [f32; 3],
+    formants: [f32; 2],
+    /// Gain of the second formant against the first.
     brightness: f32,
-    decay: f32,
 }
 
-/// (start in seconds, frequency, loudness)
-type Note = (f32, f32, f32);
+/// RBJ band-pass biquad, direct form I.
+struct Band {
+    b: [f32; 3],
+    a: [f32; 2],
+    x: [f32; 2],
+    y: [f32; 2],
+}
 
-fn render(voice: &Voice, notes: &[Note]) -> Vec<f32> {
-    let total = (RATE as f32 * LENGTH) as usize;
-    let mut dry = vec![0.0_f32; total];
-    for &(start, frequency, gain) in notes {
-        let first = (start * RATE as f32) as usize;
-        for (i, sample) in dry[first.min(total)..].iter_mut().enumerate() {
-            let t = i as f32 / RATE as f32;
-            let envelope = (t / 0.004).min(1.0) * (-t * voice.decay).exp();
-            let index = voice.brightness * (-t * 7.0).exp();
-            let modulator = (TAU * frequency * voice.ratio * t).sin();
-            let body = (TAU * frequency * t + index * modulator).sin();
-            // A soft octave below gives the note some weight.
-            let low = 0.18 * (TAU * frequency * 0.5 * t).sin() * (-t * 3.0).exp();
-            *sample += gain * envelope * (body + low);
+impl Band {
+    fn new(frequency: f32, q: f32) -> Self {
+        let w0 = TAU * frequency / RATE as f32;
+        let alpha = w0.sin() / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        Self {
+            b: [alpha / a0, 0.0, -alpha / a0],
+            a: [-2.0 * w0.cos() / a0, (1.0 - alpha) / a0],
+            x: [0.0; 2],
+            y: [0.0; 2],
         }
     }
-    // A small room: four damped feedback combs, mixed in under the dry sound.
-    let mut wet = vec![0.0_f32; total];
-    for delay in [0.0297_f32, 0.0371, 0.0411, 0.0437] {
-        let delay = (delay * RATE as f32) as usize;
-        let mut line = vec![0.0_f32; total];
-        let mut low = 0.0_f32;
-        for i in 0..total {
-            let back = if i >= delay { line[i - delay] } else { 0.0 };
-            low = 0.6 * low + 0.4 * back;
-            line[i] = dry[i] + 0.7 * low;
-            wet[i] += line[i] * 0.25;
-        }
+
+    fn step(&mut self, x: f32) -> f32 {
+        let y =
+            self.b[0] * x + self.b[2] * self.x[1] - self.a[0] * self.y[0] - self.a[1] * self.y[1];
+        self.x = [x, self.x[0]];
+        self.y = [y, self.y[0]];
+        y
     }
-    let mixed: Vec<f32> = dry.iter().zip(&wet).map(|(d, w)| d + 0.28 * w).collect();
-    let peak = mixed.iter().fold(0.0_f32, |m, s| m.max(s.abs())).max(1e-6);
-    // Fade the tail so the sound never clicks off.
-    let fade = (RATE as f32 * 0.15) as usize;
-    mixed
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let tail = ((total - i) as f32 / fade as f32).min(1.0);
-            s / peak * 0.55 * tail
-        })
-        .collect()
+}
+
+fn render(meow: &Meow) -> Vec<f32> {
+    let total = (RATE as f32 * meow.seconds) as usize;
+    let mut first = Band::new(meow.formants[0], 7.0);
+    let mut second = Band::new(meow.formants[1], 9.0);
+    let mut phase = 0.0_f32;
+    let mut out = Vec::with_capacity(total);
+    for i in 0..total {
+        let t = i as f32 / total as f32;
+        // Pitch glides through the three points: up to the peak, then down to the end.
+        let contour = if t < 0.4 {
+            meow.pitch[0] + (meow.pitch[1] - meow.pitch[0]) * ease(t / 0.4)
+        } else {
+            meow.pitch[1] + (meow.pitch[2] - meow.pitch[1]) * ease((t - 0.4) / 0.6)
+        };
+        // A slow, shallow vibrato, the way a real voice wobbles.
+        let vibrato = 1.0 + 0.012 * (TAU * 5.5 * i as f32 / RATE as f32).sin();
+        phase += TAU * contour * vibrato / RATE as f32;
+        if phase > TAU {
+            phase -= TAU;
+        }
+        // A glottal-like source: harmonics falling off with frequency, which sounds like a voice.
+        let mut source = 0.0_f32;
+        for n in 1..=24 {
+            let harmonic = n as f32;
+            if harmonic * contour * vibrato > 6000.0 {
+                break;
+            }
+            source += (harmonic * phase).sin() / harmonic;
+        }
+        // Resonances move with the mouth: the vowel opens as the pitch peaks.
+        let open = 1.0 + 0.15 * (1.0 - (t - 0.4).abs() * 2.0).max(0.0);
+        let a = first.step(source * open);
+        let b = second.step(source) * meow.brightness;
+        let t_sec = i as f32 / RATE as f32;
+        let attack = (t_sec / 0.06).min(1.0);
+        let release = ((meow.seconds - t_sec) / 0.14).clamp(0.0, 1.0);
+        out.push((a + b) * attack * release);
+    }
+    let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs())).max(1e-6);
+    out.iter().map(|s| s / peak * 0.6).collect()
+}
+
+fn ease(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
 }
 
 fn wav(samples: &[f32]) -> Vec<u8> {
@@ -83,42 +116,28 @@ fn wav(samples: &[f32]) -> Vec<u8> {
     wav
 }
 
-/// The chime for agent 0 (Claude) or 1 (Codex); kept alive for the asynchronous player.
+/// The meow for agent 0 (Claude) or 1 (Codex); kept alive for the asynchronous player.
 fn chime(agent: usize) -> &'static [u8] {
-    static CHIMES: [OnceLock<Vec<u8>>; 2] = [OnceLock::new(), OnceLock::new()];
-    CHIMES[agent.min(1)].get_or_init(|| {
-        if agent == 0 {
-            // Warm marimba: C major rising to the octave, the last note held.
-            let marimba = Voice {
-                ratio: 2.0,
-                brightness: 1.6,
-                decay: 5.5,
-            };
-            wav(&render(
-                &marimba,
-                &[
-                    (0.00, 523.25, 0.55),
-                    (0.07, 659.25, 0.55),
-                    (0.14, 783.99, 0.6),
-                    (0.24, 1046.5, 0.8),
-                ],
-            ))
+    static MEOWS: [OnceLock<Vec<u8>>; 2] = [OnceLock::new(), OnceLock::new()];
+    MEOWS[agent.min(1)].get_or_init(|| {
+        let meow = if agent == 0 {
+            // A long, sleepy "мяяяу": low start, a rising question, a soft fall.
+            Meow {
+                seconds: 1.05,
+                pitch: [520.0, 780.0, 430.0],
+                formants: [820.0, 1900.0],
+                brightness: 0.45,
+            }
         } else {
-            // Glassy bell: an open fifth and its octave, bright and short.
-            let bell = Voice {
-                ratio: 3.5,
-                brightness: 2.2,
-                decay: 4.2,
-            };
-            wav(&render(
-                &bell,
-                &[
-                    (0.00, 659.25, 0.55),
-                    (0.09, 987.77, 0.6),
-                    (0.20, 1318.5, 0.75),
-                ],
-            ))
-        }
+            // A short, bright "мяу!": quick and high, like a happy hello.
+            Meow {
+                seconds: 0.52,
+                pitch: [760.0, 1010.0, 640.0],
+                formants: [1000.0, 2400.0],
+                brightness: 0.6,
+            }
+        };
+        wav(&render(&meow))
     })
 }
 
@@ -143,13 +162,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chimes_are_valid_short_wavs_that_differ() {
+    fn meows_are_valid_short_wavs_that_differ() {
         let (claude, codex) = (chime(0), chime(1));
-        assert_eq!(&claude[..4], b"RIFF");
-        assert_eq!(&claude[8..16], b"WAVEfmt ");
-        let length = u32::from_le_bytes(claude[40..44].try_into().unwrap()) as usize;
-        assert_eq!(length + 44, claude.len());
-        assert!(length / 2 < RATE as usize * 3 / 2); // under a second and a half
+        for wav in [claude, codex] {
+            assert_eq!(&wav[..4], b"RIFF");
+            assert_eq!(&wav[8..16], b"WAVEfmt ");
+            let length = u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize;
+            assert_eq!(length + 44, wav.len());
+            assert!(length / 2 <= RATE as usize * 3 / 2); // under a second and a half
+            // The meow is audible: not silence, and not clipped to a square wave.
+            let samples: Vec<i16> = wav[44..]
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+            assert!((4000..=i16::MAX as u16).contains(&peak), "peak {peak}");
+        }
         assert_ne!(claude, codex);
     }
 }
