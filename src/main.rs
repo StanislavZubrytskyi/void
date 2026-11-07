@@ -446,6 +446,9 @@ impl eframe::App for Companion {
                 )));
             }
         }
+        if ctx.input(|i| i.time) < SETTLE_SECONDS {
+            ctx.request_repaint_after(Duration::from_millis(900));
+        }
         let time = usage::now();
         let mut changed = self.demo;
         if self
@@ -640,7 +643,7 @@ impl eframe::App for Companion {
                 {
                     self.home = Some(rect.max);
                 }
-                if self.open_size != window {
+                if self.open_size != window && ctx.input(|i| i.time) >= SETTLE_SECONDS {
                     self.open_size = window;
                     // Grow up and left from the cat's corner, so the cat itself stays put.
                     if let Some(anchor) = self.home.or(outer.map(|rect| rect.max)) {
@@ -722,6 +725,11 @@ fn spent(minutes: &[(u64, u64)], records: &[Record], now: u64) -> [Option<u64>; 
         )
     })
 }
+
+/// Startup grace: the system places the window (docking it bottom-right) a moment after the
+/// first frame, and egui reports the old position until then. Resizing before it settles would
+/// anchor the cat to that stale corner and send it to the top left of the screen.
+const SETTLE_SECONDS: f64 = 0.8;
 
 /// The open panel closes after this long without the pointer on it.
 const PANEL_IDLE_SECONDS: f64 = 30.0;
