@@ -113,7 +113,7 @@ pub fn agent(
     now: u64,
     offset: i64,
 ) -> Agent {
-    let (state, value, caption) = if let Some((window, reset)) = status.blocked {
+    let (state, mut value, mut caption) = if let Some((window, reset)) = status.blocked {
         (
             "ПАУЗА",
             advice::countdown(reset, now),
@@ -164,7 +164,7 @@ pub fn agent(
             unavailable.unwrap_or(&speech.detail).to_owned(),
         )
     };
-    let windows = advice::WINDOWS
+    let windows: Vec<Quota> = advice::WINDOWS
         .iter()
         .map(|(name, select)| {
             let latest = usage::last_window(records, *select);
@@ -203,6 +203,38 @@ pub fn agent(
             }
         })
         .collect();
+    // Lead with what is left of the tighter limit; the forecast and the reset explain it.
+    if status.blocked.is_none()
+        && let Some(binding) = windows
+            .iter()
+            .filter(|quota| quota.remaining.is_some_and(|left| left > 0.0))
+            .min_by(|a, b| {
+                a.remaining
+                    .partial_cmp(&b.remaining)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    {
+        let prompts = |count: Option<f64>| {
+            count
+                .map(|n| format!(" · ≈ {n:.0} запитів"))
+                .unwrap_or_default()
+        };
+        let outlook = match (&status.risk, status.lasting) {
+            (Some(risk), _) => format!(
+                "вистачить на ≈ {}{}",
+                crate::duration(risk.minutes),
+                prompts(risk.prompts)
+            ),
+            (None, Some((_, _, count, _))) => format!("вистачить до оновлення{}", prompts(count)),
+            _ => "прогноз з’явиться з історією роботи".to_owned(),
+        };
+        let reset = binding.reset.strip_prefix("↻ ").map_or_else(
+            || "час оновлення невідомий".to_owned(),
+            |at| format!("оновлення {at}"),
+        );
+        value = binding.value.clone();
+        caption = format!("ліміт {} · {reset}\n{outlook}", binding.name);
+    }
     let seen = records
         .iter()
         .filter(|r| r.sample.rate_limits.is_some())
@@ -655,19 +687,25 @@ fn tool_name(tool: &str) -> &str {
     tool.rsplit("__").next().unwrap_or(tool)
 }
 
-pub fn busy_card_size(sessions: usize) -> Vec2 {
+const ROW: f32 = 56.0;
+
+pub fn busy_card_size(sessions: usize, hint: bool) -> Vec2 {
     let rows = sessions.min(BUSY_ROWS) as f32;
     let more = if sessions > BUSY_ROWS { 18.0 } else { 0.0 };
-    Vec2::new(BUSY_WIDTH, 44.0 + rows * 40.0 + more + 34.0)
+    let footer = if hint { 54.0 } else { 34.0 };
+    Vec2::new(BUSY_WIDTH, 44.0 + rows * ROW + more + footer)
 }
 
 /// What the hovered agent is doing: one row per busy session and the quota in one line.
+#[allow(clippy::too_many_arguments)]
 pub fn busy_card(
     painter: &egui::Painter,
     rect: Rect,
     agent: usize,
     sessions: &[crate::activity::Session],
+    predictions: &[Option<String>],
     quota: &str,
+    hint: Option<&str>,
     now: u64,
     time: Option<f64>,
 ) {
@@ -719,7 +757,7 @@ pub fn busy_card(
         SECONDARY,
     );
     y += 30.0;
-    for session in sessions.iter().take(BUSY_ROWS) {
+    for (i, session) in sessions.iter().take(BUSY_ROWS).enumerate() {
         let project = if session.project.is_empty() {
             "Без назви"
         } else {
@@ -748,7 +786,19 @@ pub fn busy_card(
             regular(10.5),
             SECONDARY,
         );
-        y += 40.0;
+        // The forecast for this turn, in the agent's color; quiet until there is history.
+        let (forecast, tone) = match predictions.get(i).cloned().flatten() {
+            Some(text) => (text, color.gamma_multiply(0.85)),
+            None => ("прогноз з'явиться після кількох ходів".to_owned(), GRAY),
+        };
+        painter.text(
+            Pos2::new(left, y + 33.0),
+            egui::Align2::LEFT_TOP,
+            forecast,
+            regular(10.5),
+            tone,
+        );
+        y += ROW;
     }
     if sessions.len() > BUSY_ROWS {
         painter.text(
@@ -771,6 +821,15 @@ pub fn busy_card(
         regular(10.5),
         SECONDARY,
     );
+    if let Some(hint) = hint {
+        painter.text(
+            Pos2::new(left, y + 29.0),
+            egui::Align2::LEFT_TOP,
+            format!("→ {hint}"),
+            strong(11.0),
+            LABEL,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -787,7 +846,11 @@ mod tests {
         assert_eq!(elapsed(1000, 1030), "щойно");
         assert_eq!(elapsed(0, 65 * 60), "1 год 05 хв");
         assert_eq!(tool_name("mcp__github__create_issue"), "create_issue");
-        assert_eq!(busy_card_size(5).y, busy_card_size(3).y + 18.0);
+        assert_eq!(
+            busy_card_size(5, false).y,
+            busy_card_size(3, false).y + 18.0
+        );
+        assert_eq!(busy_card_size(1, true).y, busy_card_size(1, false).y + 20.0);
     }
     #[test]
     fn provider_cards_keep_their_own_windows_and_estimate_labels() {
@@ -818,6 +881,13 @@ mod tests {
         assert!(a.source.starts_with("Локальна оцінка"));
         assert_eq!(b.state, "ПРОГНОЗ");
         assert_eq!(b.windows[0].value, "24% лишилось");
+        // The headline is what is left of the tighter limit, not a duration.
+        assert_eq!(b.value, "24% лишилось");
+        assert!(
+            b.caption.starts_with("ліміт 5 год · оновлення "),
+            "{}",
+            b.caption
+        );
         assert!(b.caption.contains("12 запитів"));
     }
     #[test]

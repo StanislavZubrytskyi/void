@@ -1,5 +1,5 @@
-//! Which agent sessions are working right now, from the tails of their local transcripts.
-//! Only the project folder name, the turn start and the current tool name leave this module.
+//! Which agent sessions are working right now, and how their last turn went, from the tails
+//! of their local transcripts: project folder, turn start and end, current tool, prompt text.
 
 use serde_json::Value;
 use std::{
@@ -23,6 +23,34 @@ pub struct Session {
     pub since: u64,
     /// The tool the agent is running now, if any.
     pub tool: Option<String>,
+    /// Still working; otherwise this describes the last finished turn.
+    pub busy: bool,
+    /// The last transcript moment of the turn.
+    pub end: u64,
+    /// What the user asked for in this turn, cut to PROMPT_CHARS.
+    pub prompt: Option<String>,
+}
+
+const PROMPT_CHARS: usize = 1000;
+
+fn prompt_text(text: &str) -> String {
+    text.trim().chars().take(PROMPT_CHARS).collect()
+}
+
+/// The last turn of one transcript: 0 is Claude, 1 is Codex.
+pub fn read_turn(agent: usize, path: &Path) -> Option<Session> {
+    let lines = tail_lines(path)?;
+    let mut turn = if agent == 0 {
+        claude_turn(&lines)?
+    } else {
+        let mut turn = codex_turn(&lines)?;
+        turn.project = first_line(path)
+            .and_then(|line| codex_project(&line))
+            .unwrap_or_default();
+        turn
+    };
+    turn.id = path.to_path_buf();
+    Some(turn)
 }
 
 /// Busy sessions for Claude and Codex, in that order, the longest-running first.
@@ -32,35 +60,23 @@ pub fn scan() -> [Vec<Session>; 2] {
             .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
     };
-    let mut claude = Vec::new();
-    if let Some(projects) = crate::claude::config_dir().map(|dir| dir.join("projects")) {
-        // Main transcripts sit directly in a project folder; subagent ones are nested deeper.
-        for path in recent(&projects, 1) {
-            claude.extend(
-                tail_lines(&path)
-                    .and_then(|lines| claude_turn(&lines))
-                    .map(|session| Session {
-                        id: path,
-                        ..session
-                    }),
-            );
-        }
-    }
-    let mut codex = Vec::new();
+    let busy = |agent: usize, paths: Vec<PathBuf>| -> Vec<Session> {
+        paths
+            .iter()
+            .filter_map(|path| read_turn(agent, path))
+            .filter(|turn| turn.busy)
+            .collect()
+    };
+    // Main Claude transcripts sit directly in a project folder; subagent ones are nested deeper.
+    let mut claude = crate::claude::config_dir()
+        .map(|dir| busy(0, recent(&dir.join("projects"), 1)))
+        .unwrap_or_default();
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| home().map(|home| home.join(".codex")));
-    if let Some(sessions) = codex_home.map(|home| home.join("sessions")) {
-        for path in recent(&sessions, 3) {
-            let project = first_line(&path).and_then(|line| codex_project(&line));
-            codex.extend(tail_lines(&path).and_then(|lines| codex_turn(&lines)).map(
-                |mut session| {
-                    session.project = project.unwrap_or_default();
-                    session
-                },
-            ));
-        }
-    }
+    let mut codex = codex_home
+        .map(|home| busy(1, recent(&home.join("sessions"), 3)))
+        .unwrap_or_default();
     for sessions in [&mut claude, &mut codex] {
         sessions.sort_by_key(|session| session.since);
     }
@@ -138,6 +154,7 @@ fn timestamp(entry: &Value) -> Option<u64> {
 /// running; `end_turn` (or an interrupt) ends it.
 fn claude_turn(lines: &[String]) -> Option<Session> {
     let (mut busy, mut since, mut tool, mut cwd) = (false, 0, None, None);
+    let (mut end, mut prompt) = (0, None);
     for line in lines {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -160,18 +177,27 @@ fn claude_turn(lines: &[String]) -> Option<Session> {
                     _ => None,
                 };
                 match text {
-                    Some(text) if text.starts_with("[Request interrupted") => busy = false,
+                    // An interrupted turn says nothing about how long such work takes.
+                    Some(text) if text.starts_with("[Request interrupted") => {
+                        busy = false;
+                        since = 0;
+                    }
                     // Slash commands like /exit run locally, without a model turn.
                     Some(text)
                         if text.starts_with("<command-") || text.starts_with("<local-command") => {}
                     // A tool result continues the turn; a new prompt starts one.
-                    None => tool = None,
-                    Some(_) => {
+                    None => {
+                        tool = None;
+                        end = time;
+                    }
+                    Some(text) => {
                         if !busy {
                             since = time;
+                            prompt = Some(prompt_text(text));
                         }
                         busy = true;
                         tool = None;
+                        end = time;
                     }
                 }
             }
@@ -180,12 +206,17 @@ fn claude_turn(lines: &[String]) -> Option<Session> {
                     .pointer("/message/stop_reason")
                     .and_then(Value::as_str)
                 {
-                    Some("end_turn" | "max_tokens" | "stop_sequence" | "refusal") => busy = false,
+                    Some("end_turn" | "max_tokens" | "stop_sequence" | "refusal") => {
+                        busy = false;
+                        end = time;
+                    }
                     _ => {
                         if !busy {
                             since = time;
+                            prompt = None; // the tail starts mid-turn: the prompt is out of view
                         }
                         busy = true;
+                        end = time;
                         if let Some(name) = content
                             .and_then(Value::as_array)
                             .and_then(|blocks| {
@@ -203,11 +234,14 @@ fn claude_turn(lines: &[String]) -> Option<Session> {
             _ => {}
         }
     }
-    busy.then(|| Session {
+    (since > 0).then(|| Session {
         id: PathBuf::new(),
         project: cwd.as_deref().map(folder_name).unwrap_or_default(),
         since,
         tool,
+        busy,
+        end,
+        prompt,
     })
 }
 
@@ -222,18 +256,43 @@ fn codex_project(line: &str) -> Option<String> {
 /// `turn_aborted` closes it.
 fn codex_turn(lines: &[String]) -> Option<Session> {
     let (mut busy, mut since, mut tool) = (false, 0, None);
+    let (mut end, mut prompt) = (0, None);
     for line in lines {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let kind = entry.pointer("/payload/type").and_then(Value::as_str);
+        if busy && let Some(time) = timestamp(&entry) {
+            end = time;
+        }
         match (entry.get("type").and_then(Value::as_str), kind) {
             (Some("event_msg"), Some("task_started")) => {
                 busy = true;
                 since = timestamp(&entry).unwrap_or(0);
+                end = since;
                 tool = None;
+                prompt = None;
             }
-            (Some("event_msg"), Some("task_complete" | "turn_aborted")) => busy = false,
+            (Some("event_msg"), Some("task_complete")) => busy = false,
+            (Some("event_msg"), Some("turn_aborted")) => {
+                busy = false;
+                since = 0;
+            }
+            // The first user text that is not injected context (AGENTS.md, environment) is the ask.
+            (Some("response_item"), Some("message"))
+                if busy
+                    && prompt.is_none()
+                    && entry.pointer("/payload/role").and_then(Value::as_str) == Some("user") =>
+            {
+                prompt = entry
+                    .pointer("/payload/content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("text")?.as_str())
+                    .find(|text| !text.starts_with('<') && !text.starts_with("# AGENTS.md"))
+                    .map(prompt_text);
+            }
             (Some("response_item"), Some("function_call" | "custom_tool_call")) => {
                 tool = entry
                     .pointer("/payload/name")
@@ -246,11 +305,14 @@ fn codex_turn(lines: &[String]) -> Option<Session> {
             _ => {}
         }
     }
-    busy.then(|| Session {
+    (since > 0).then(|| Session {
         id: PathBuf::new(),
         project: String::new(),
         since,
         tool,
+        busy,
+        end,
+        prompt,
     })
 }
 
@@ -291,7 +353,11 @@ mod tests {
         let thinking =
             claude_turn(&lines(&[prompt.clone(), call.clone(), result.clone()])).unwrap();
         assert_eq!((thinking.since, thinking.tool), (running.since, None));
-        assert!(claude_turn(&lines(&[prompt.clone(), call.clone(), result, done])).is_none());
+        assert_eq!(running.prompt.as_deref(), Some("fix it"));
+        let finished = claude_turn(&lines(&[prompt.clone(), call.clone(), result, done])).unwrap();
+        assert!(!finished.busy);
+        assert_eq!(finished.end - finished.since, 120);
+        assert_eq!(finished.prompt.as_deref(), Some("fix it"));
         let stop = user(
             "2026-11-07T10:00:09Z",
             "[Request interrupted by user]".into(),
@@ -305,10 +371,20 @@ mod tests {
         let call = serde_json::json!({"timestamp":"2026-11-07T10:00:03Z","type":"response_item",
             "payload":{"type":"function_call","name":"shell"}});
         let started = event("2026-11-07T10:00:00Z", "task_started");
-        let running = codex_turn(&lines(&[started.clone(), call.clone()])).unwrap();
+        let ask = serde_json::json!({"timestamp":"2026-11-07T10:00:01Z","type":"response_item",
+            "payload":{"type":"message","role":"user","content":[
+                {"type":"input_text","text":"# AGENTS.md instructions"},
+                {"type":"input_text","text":"<environment_context>"},
+                {"type":"input_text","text":"add a login page"}]}});
+        let running = codex_turn(&lines(&[started.clone(), ask.clone(), call.clone()])).unwrap();
+        assert!(running.busy);
         assert_eq!(running.tool.as_deref(), Some("shell"));
+        assert_eq!(running.prompt.as_deref(), Some("add a login page"));
         let done = event("2026-11-07T10:05:00Z", "task_complete");
-        assert!(codex_turn(&lines(&[started, call, done])).is_none());
+        let finished = codex_turn(&lines(&[started.clone(), ask, call.clone(), done])).unwrap();
+        assert_eq!((finished.busy, finished.end - finished.since), (false, 300));
+        let aborted = event("2026-11-07T10:01:00Z", "turn_aborted");
+        assert!(codex_turn(&lines(&[started, call, aborted])).is_none());
         let meta = r#"{"type":"session_meta","payload":{"cwd":"/home/me/api/"}}"#;
         assert_eq!(codex_project(meta).as_deref(), Some("api"));
     }

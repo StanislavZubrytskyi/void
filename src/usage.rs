@@ -114,6 +114,12 @@ pub fn save(sample: Sample) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn append(mut sample: Sample, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    sample.time = now();
+    append_line(&serde_json::to_vec(&sample)?, path)
+}
+
+/// Append one JSON line to a bounded local history file (compacted to its newest ~2 MB).
+pub fn append_line(json: &[u8], path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(path.parent().unwrap())?;
     let mut file = OpenOptions::new()
         .read(true)
@@ -122,7 +128,6 @@ fn append(mut sample: Sample, path: &Path) -> Result<(), Box<dyn std::error::Err
         .truncate(false)
         .open(path)?;
     file.lock()?;
-    sample.time = now();
     let len = file.metadata()?.len();
     // Keep a bounded local history. The exclusive lock covers compaction and append.
     if len >= HISTORY_BYTES * 2 {
@@ -136,7 +141,7 @@ fn append(mut sample: Sample, path: &Path) -> Result<(), Box<dyn std::error::Err
         file.set_len(tail.len() as u64)?;
     }
     file.seek(SeekFrom::End(0))?;
-    let mut line = serde_json::to_vec(&sample)?;
+    let mut line = json.to_vec();
     line.push(b'\n');
     file.write_all(&line)?;
     Ok(())

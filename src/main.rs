@@ -11,6 +11,7 @@ mod runtime;
 mod statusline;
 #[cfg(windows)]
 mod tray;
+mod turns;
 mod usage;
 
 use advice::{Status, Tone};
@@ -76,6 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 busy_claude.len(),
                 busy_codex.len()
             );
+            println!("Finished turns remembered: {}", turns::load().len());
             println!("Codex session samples: {}", codex::history().len());
             println!(
                 "Codex account limits: {}",
@@ -116,6 +118,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 claude.len(),
                                 codex.len()
                             );
+                        }
+                        runtime::Update::Turns(history) => {
+                            println!("Finished turns remembered: {}", history.len());
                         }
                     }
                 }
@@ -192,8 +197,11 @@ fn desktop(demo: bool) -> Result<(), Box<dyn std::error::Error>> {
                 claude_estimate: Vec::new(),
                 updated: None,
                 details: false,
+                details_seen: None,
                 selected_provider: 0,
                 open_size: Vec2::new(96.0, 88.0),
+                home: None,
+                shift: Vec2::ZERO,
                 positioned: false,
                 offset: advice::utc_offset(),
                 notified: HashSet::new(),
@@ -207,6 +215,8 @@ fn desktop(demo: bool) -> Result<(), Box<dyn std::error::Error>> {
                     hover: None,
                     shown: None,
                     away: None,
+                    turns: Vec::new(),
+                    predictions: Default::default(),
                     reduced: std::env::var_os("VOID_REDUCED_MOTION").is_some(),
                 },
             }))
@@ -230,8 +240,14 @@ struct Companion {
     claude_estimate: Vec<Record>,
     updated: Option<std::time::Instant>,
     details: bool,
+    /// Last moment the open panel had the pointer on it.
+    details_seen: Option<f64>,
     selected_provider: usize,
     open_size: Vec2,
+    /// Where the cat's bottom-right corner lives when nothing is open.
+    home: Option<Pos2>,
+    /// How far the window was pushed to keep an open card on screen.
+    shift: Vec2,
     positioned: bool,
     offset: i64,
     notified: HashSet<(String, u64)>,
@@ -250,6 +266,10 @@ struct Busy {
     /// When the pointer was last reported gone while a card was open.
     away: Option<f64>,
     reduced: bool,
+    /// Finished turns, for predictions and advice.
+    turns: Vec<turns::Turn>,
+    /// Per running turn (transcript, start): predicting reads every stored prompt, so once.
+    predictions: std::collections::HashMap<(std::path::PathBuf, u64), Option<turns::Prediction>>,
 }
 
 impl Busy {
@@ -263,6 +283,7 @@ impl Busy {
         bounds: egui::Rect,
         cat: egui::Rect,
         statuses: [&Status; 2],
+        records: [&[Record]; 2],
         now: u64,
         offset: i64,
     ) -> (Vec2, Option<usize>) {
@@ -340,7 +361,29 @@ impl Busy {
         let Some(agent) = hover else {
             return (closed, clicked);
         };
-        let size = panel::busy_card_size(self.sessions[agent].len());
+        let predictions: Vec<Option<String>> = self.sessions[agent]
+            .iter()
+            .map(|session| {
+                self.predictions
+                    .entry((session.id.clone(), session.since))
+                    .or_insert_with(|| {
+                        turns::predict(
+                            &self.turns,
+                            agent,
+                            &session.project,
+                            session.prompt.as_deref(),
+                            records[agent],
+                        )
+                    })
+                    .as_ref()
+                    .map(|prediction| {
+                        turns::describe(prediction, now.saturating_sub(session.since) as f64 / 60.0)
+                    })
+            })
+            .collect();
+        let left = [0, 1].map(|other| turns::turns_left(&self.turns, other, records[other], now));
+        let hint = turns::hint(agent, left, statuses);
+        let size = panel::busy_card_size(self.sessions[agent].len(), hint.is_some());
         let window = Vec2::new(
             (size.x + panel::MARGIN * 2.0).max(closed.x),
             88.0 + panel::STRIP + 6.0 + size.y + panel::MARGIN,
@@ -359,7 +402,9 @@ impl Busy {
                 card,
                 agent,
                 &self.sessions[agent],
+                &predictions,
                 &quota_line(statuses[agent], now, offset),
+                hint.as_deref(),
                 now,
                 time,
             );
@@ -431,6 +476,10 @@ impl eframe::App for Companion {
                         self.codex_online = online;
                     }
                     runtime::Update::Activity(sessions) => self.busy.sessions = sessions,
+                    runtime::Update::Turns(history) => {
+                        self.busy.turns = history;
+                        self.busy.predictions.clear();
+                    }
                 }
             }
         }
@@ -519,6 +568,7 @@ impl eframe::App for Companion {
                         bounds,
                         cat_rect,
                         [&claude_status, &codex_status],
+                        [claude, &self.codex_records],
                         time,
                         self.offset,
                     );
@@ -541,11 +591,35 @@ impl eframe::App for Companion {
                     self.details = !self.details;
                     ctx.request_repaint();
                 }
+                let outer = ctx.input(|i| i.viewport().outer_rect);
+                // Follow drags while nothing is pushed aside; ignore sub-point rounding at 125%
+                // scale, or the cat would creep a pixel with every open and close.
+                if self.shift == Vec2::ZERO
+                    && let Some(rect) = outer
+                    && self
+                        .home
+                        .is_none_or(|home| (home - rect.max).length() > 2.0)
+                {
+                    self.home = Some(rect.max);
+                }
                 if self.open_size != window {
                     self.open_size = window;
-                    // Grow up and left from the bottom-right corner, so the cat itself never moves.
-                    if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-                        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(rect.max - window));
+                    // Grow up and left from the cat's corner, so the cat itself stays put.
+                    if let Some(anchor) = self.home.or(outer.map(|rect| rect.max)) {
+                        let wanted = anchor - window;
+                        let mut at = wanted;
+                        // Near a screen edge the card would open off-screen: slide the window
+                        // in instead, and let the cat come home when it closes.
+                        // shortcut: assumes the cat's monitor starts at 0,0; other monitors skip this.
+                        if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size)
+                            && (0.0..=monitor.x).contains(&anchor.x)
+                            && (0.0..=monitor.y).contains(&anchor.y)
+                        {
+                            at.x = at.x.clamp(0.0, (monitor.x - window.x).max(0.0));
+                            at.y = at.y.clamp(0.0, (monitor.y - window.y).max(0.0));
+                        }
+                        self.shift = at - wanted;
+                        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(at));
                     }
                     ctx.send_viewport_cmd(ViewportCommand::InnerSize(window));
                 }
@@ -553,9 +627,25 @@ impl eframe::App for Companion {
                 self.pet
                     .draw(ui, cat_rect, !asleep || self.details || cat.hovered());
             });
+        // An open panel nobody looks at closes itself: the pointer resting on it keeps it open.
+        if self.details {
+            let clock = ctx.input(|input| input.time);
+            let seen = *self.details_seen.get_or_insert(clock);
+            if ctx.pointer_hover_pos().is_some() {
+                self.details_seen = Some(clock);
+            } else if clock - seen >= PANEL_IDLE_SECONDS {
+                self.details = false;
+                ctx.request_repaint();
+            }
+        } else {
+            self.details_seen = None;
+        }
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 }
+
+/// The open panel closes after this long without the pointer on it.
+const PANEL_IDLE_SECONDS: f64 = 30.0;
 
 /// The closed cat sleeps only while every agent with data is blocked.
 fn asleep(agents: [&Status; 2]) -> bool {
@@ -700,6 +790,9 @@ fn demo_busy(time: u64) -> [Vec<activity::Session>; 2] {
         project: project.into(),
         since: time - minutes * 60,
         tool: tool.map(Into::into),
+        busy: true,
+        end: time,
+        prompt: Some(format!("demo task in {project}")),
     };
     [
         vec![

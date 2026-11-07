@@ -14,7 +14,7 @@ Rust · Windows · Local first · MIT
 
 ## What Void does
 
-Click the cat to open a compact monochrome glass panel. Switch between **Claude** and **Codex** to see quota remaining, reset times when available, and a personal forecast once enough measurements exist.
+Click the cat to open a compact monochrome glass panel. Switch between **Claude** and **Codex**: the headline is how much of the tighter limit is left ("86% лишилось"), followed by which limit that is, when it resets, and a personal forecast once enough measurements exist. Subscriptions report percentages, not token counts, so Void shows percentages. The panel closes by itself after 30 seconds without the pointer on it.
 
 - Separate five-hour and weekly limits for each provider.
 - Time and typical prompts remaining, based on observed consumption.
@@ -23,6 +23,8 @@ Click the cat to open a compact monochrome glass panel. Switch between **Claude*
 - Transparent animated cat, draggable across the desktop.
 - Windows system tray, optional startup and notifications; no taskbar button.
 - Explicit missing and stale data. Unknown values stay unknown.
+- A thought bubble above the cat while Claude Code or Codex is working. Hover it for each running turn: project, elapsed time, current tool, and a forecast from your own past turns with similar prompts ("схожі: ще ≈ 6 хв · ≈ 4% квоти").
+- Advice on where the next task should go, from how many typical turns each agent's five-hour quota still holds.
 
 ## Install on Windows
 
@@ -92,10 +94,13 @@ The first command reports source availability. The second observes background up
 | `VOID_DATA_DIR` | Override the default `~/.void` history directory |
 | `VOID_CODEX_BIN` | Absolute path to the Codex binary |
 | `VOID_REDUCED_MOTION=1` | Disable continuous cat animation |
+| `VOID_NO_PROMPTS=1` | Remember finished turns without their prompt text |
 | `CODEX_HOME` | Existing Codex configuration/session location |
 | `CLAUDE_CONFIG_DIR` | Existing Claude Code configuration location |
 
-Void stores bounded numeric Claude history locally. It parses relevant local session metadata but does not persist conversation text. Account requests go to the provider through Codex app-server or, for the optional Claude CLI source, the Anthropic quota endpoint. Claude CLI credentials are passed to system curl through stdin, not command-line arguments; Void does not store or refresh them.
+Void stores bounded numeric Claude history locally. It also remembers finished agent turns in `~/.void/turns.jsonl`: agent, project folder name, start and end time, and the first 1000 characters of your prompt. Prompts are used only on this machine, to find similar past work for forecasts; they are never sent anywhere. Set `VOID_NO_PROMPTS=1` to keep turns without text, or delete the file to forget them. Responses, tool output and other conversation content are not stored. Void does not watch running processes; it reads only the agents' own local transcripts.
+
+Account requests go to the provider through Codex app-server or, for the optional Claude CLI source, the Anthropic quota endpoint. Claude CLI credentials are passed to system curl through stdin, not command-line arguments. Five minutes before the CLI access token expires, Void refreshes it the way Claude Code does: under Claude Code's own refresh lock, writing the new tokens back atomically to `.credentials.json`, so the CLI and Void keep sharing one login. Refresh attempts are limited to one per five minutes.
 
 The installer preserves an existing Claude status line and chains its output. Uninstallation restores it. Manual commands: `void connect-statusline` and `void disconnect-statusline`. Invalid settings JSON is left untouched. History remains after uninstall; close Void before deleting `~/.void` to remove it.
 
@@ -111,7 +116,7 @@ Build output and local data do not belong in the public repository. No paid AI s
 
 ## Contributing
 
-Keep provider data separate, preserve uncertainty, and avoid logging secrets or conversation content. Run formatting, Clippy and tests before submitting a change. For quota fixes, include a sanitized fixture rather than a personal session file.
+Keep provider data separate, preserve uncertainty, never log secrets, and never send prompt text off the machine. Run formatting, Clippy and tests before submitting a change. For quota fixes, include a sanitized fixture rather than a personal session file.
 
 ## License
 

@@ -14,23 +14,58 @@ pub enum Update {
     Codex(Vec<Record>, bool),
     /// Busy sessions: Claude, then Codex.
     Activity([Vec<crate::activity::Session>; 2]),
+    /// The finished-turn history, after start and after each new turn.
+    Turns(Vec<crate::turns::Turn>),
 }
 pub fn start(ctx: eframe::egui::Context) -> Receiver<Update> {
     let (send, receive) = mpsc::sync_channel(8);
     let busy = send.clone();
     let repaint = ctx.clone();
     thread::spawn(move || {
+        if busy.send(Update::Turns(crate::turns::load())).is_err() {
+            return;
+        }
         let mut last: Option<[Vec<crate::activity::Session>; 2]> = None;
+        let mut recorded = std::collections::HashSet::new();
         loop {
             let mut sessions = crate::activity::scan();
-            // A long turn scrolls out of the transcript tail: keep the start we saw earlier.
+            // A long turn scrolls out of the transcript tail: keep what we saw earlier.
             if let Some(previous) = &last {
                 for (now, before) in sessions.iter_mut().zip(previous) {
                     for session in now {
                         if let Some(seen) = before.iter().find(|seen| seen.id == session.id) {
                             session.since = session.since.min(seen.since);
+                            if session.prompt.is_none() {
+                                session.prompt.clone_from(&seen.prompt);
+                            }
                         }
                     }
+                }
+                // A session that stopped being busy finished its turn: remember how it went.
+                // shortcut: turns that finish while Void is closed are not recorded.
+                let mut saved = false;
+                for (agent, before) in previous.iter().enumerate() {
+                    for gone in before
+                        .iter()
+                        .filter(|seen| !sessions[agent].iter().any(|s| s.id == seen.id))
+                    {
+                        if let Some(turn) = crate::activity::read_turn(agent, &gone.id)
+                            .filter(|turn| !turn.busy && turn.end >= gone.since)
+                            && recorded.insert((gone.id.clone(), gone.since))
+                        {
+                            saved |= crate::turns::save(&crate::turns::Turn {
+                                agent,
+                                project: turn.project,
+                                start: gone.since,
+                                end: turn.end,
+                                prompt: turn.prompt.or_else(|| gone.prompt.clone()),
+                            })
+                            .is_ok();
+                        }
+                    }
+                }
+                if saved && busy.send(Update::Turns(crate::turns::load())).is_err() {
+                    break;
                 }
             }
             if last.as_ref() != Some(&sessions) {
