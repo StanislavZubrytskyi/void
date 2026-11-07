@@ -317,7 +317,8 @@ impl Busy {
         if agents.is_empty() {
             self.hover = None;
             self.shown = None;
-            return (Vec2::new(96.0, 88.0), None);
+            // Headroom above the cat for the sleeping z letters; the window is transparent.
+            return (Vec2::new(96.0, 88.0 + panel::STRIP), None);
         }
         let clock = ui.input(|input| input.time);
         let shown = *self.shown.get_or_insert(clock);
@@ -661,11 +662,12 @@ impl eframe::App for Companion {
                     ctx.send_viewport_cmd(ViewportCommand::InnerSize(window));
                 }
                 // The cat sleeps only while every agent with data is blocked.
-                self.pet.draw(
-                    ui,
-                    cat_rect,
-                    cat_awake(asleep, working, self.details, cat.hovered()),
-                );
+                let awake = cat_awake(asleep, working, self.details, cat.hovered());
+                self.pet.draw(ui, cat_rect, awake);
+                if !awake {
+                    let time = (!self.busy.reduced).then(|| ui.input(|input| input.time));
+                    panel::sleep_zs(ui.painter(), cat_rect, time);
+                }
             });
         // An open menu nobody looks at closes itself: only the pointer resting on the menu or
         // the cat keeps it open. A click in another window closes it at once.

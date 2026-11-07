@@ -551,6 +551,37 @@ fn settings_body(
     action
 }
 
+/// Three little "z"s drifting up from the cat's head while it sleeps. Each rises, grows and
+/// fades, one after another. `time` is None under reduced motion: they stay put, faded.
+pub fn sleep_zs(painter: &egui::Painter, cat: Rect, time: Option<f64>) {
+    const CYCLE: f32 = 2.6;
+    let head = Pos2::new(cat.center().x + 14.0, cat.top() + 14.0);
+    for i in 0..3 {
+        let phase = i as f32 / 3.0;
+        let (rise, alpha) = match time {
+            Some(t) => {
+                let p = ((t as f32 / CYCLE) + phase).rem_euclid(1.0);
+                // Fade in over the first fifth of the rise, out over the last third.
+                let fade = (p / 0.2).min(1.0) * ((1.0 - p) / 0.35).min(1.0);
+                (p, fade)
+            }
+            None => (0.5, 0.6),
+        };
+        let size = 12.0 + 6.0 * rise;
+        let at = Pos2::new(
+            head.x + 10.0 * i as f32 + 6.0 * (rise * std::f32::consts::TAU).sin(),
+            head.y - 6.0 - 26.0 * rise - 10.0 * i as f32,
+        );
+        painter.text(
+            at,
+            egui::Align2::CENTER_CENTER,
+            "z",
+            strong(size),
+            Color32::from_white_alpha((alpha * 255.0) as u8),
+        );
+    }
+}
+
 /// Height above the cat taken by the thought bubble while an agent works.
 pub const STRIP: f32 = 44.0;
 const SEGMENT: f32 = 48.0;
