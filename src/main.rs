@@ -513,9 +513,9 @@ impl eframe::App for Companion {
                     }
                     runtime::Update::Activity(sessions) => self.busy.sessions = sessions,
                     runtime::Update::Tokens(agent, minutes) => self.tokens[agent] = minutes,
-                    runtime::Update::Finished(agent) => {
+                    runtime::Update::Finished(_) => {
                         if self.settings.sound {
-                            sound::play(agent);
+                            sound::play();
                         }
                     }
                     runtime::Update::Turns(history) => {
@@ -627,10 +627,10 @@ impl eframe::App for Companion {
                                 self.settings.sound = on;
                                 let _ = settings::save(&self.settings);
                                 if on {
-                                    sound::play(0);
+                                    sound::play();
                                 }
                             }
-                            Some(panel::Action::Preview) => sound::play(0),
+                            Some(panel::Action::Preview) => sound::play(),
                             None => {}
                         }
                     }
