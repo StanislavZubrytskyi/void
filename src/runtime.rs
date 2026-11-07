@@ -16,6 +16,8 @@ pub enum Update {
     Activity([Vec<crate::activity::Session>; 2]),
     /// An agent (0 Claude, 1 Codex) just finished a turn.
     Finished(usize),
+    /// Recent project folders per agent, newest first: choices for a new task.
+    Projects([Vec<crate::projects::Project>; 2]),
     /// Tokens an agent spent, per minute, over the last eight days.
     Tokens(usize, Vec<(u64, u64)>),
 }
@@ -26,8 +28,16 @@ pub fn start(ctx: eframe::egui::Context) -> Receiver<Update> {
     thread::spawn(move || {
         let mut last: Option<[Vec<crate::activity::Session>; 2]> = None;
         let mut recorded = std::collections::HashSet::new();
+        let mut listed = None::<Instant>;
         let mut deepened = std::collections::HashSet::new();
         loop {
+            if listed.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
+                listed = Some(Instant::now());
+                let found = [0, 1].map(crate::projects::recent);
+                if busy.send(Update::Projects(found)).is_err() {
+                    break;
+                }
+            }
             let mut sessions = crate::activity::scan();
             // A turn already long when first seen lost its prompt from the tail: look further
             // back once, which also finds its true start and token count.

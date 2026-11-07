@@ -161,7 +161,7 @@ fn tail_lines(path: &Path, tail: u64) -> Option<Vec<String>> {
     Some(lines)
 }
 
-fn first_line(path: &Path) -> Option<String> {
+pub fn first_line(path: &Path) -> Option<String> {
     let mut line = String::new();
     BufReader::new(File::open(path).ok()?)
         .take(64 * 1024)
@@ -170,7 +170,7 @@ fn first_line(path: &Path) -> Option<String> {
     Some(line)
 }
 
-fn folder_name(cwd: &str) -> String {
+pub fn folder_name(cwd: &str) -> String {
     cwd.trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
         .next()

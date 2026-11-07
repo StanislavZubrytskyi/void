@@ -416,7 +416,7 @@ pub fn account_snapshot() -> Option<Record> {
     Connection::open()?.snapshot()
 }
 
-fn codex_binary() -> Option<PathBuf> {
+pub fn codex_binary() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("VOID_CODEX_BIN").map(PathBuf::from)
         && path.is_absolute()
         && path.is_file()

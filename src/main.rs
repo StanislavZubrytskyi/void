@@ -7,8 +7,10 @@ mod advice;
 mod claude;
 mod codex;
 mod estimate;
+mod launch;
 mod panel;
 mod pet;
+mod projects;
 mod runtime;
 mod settings;
 mod sound;
@@ -82,6 +84,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 busy_codex.len()
             );
             println!("Finished turns remembered: {}", turns::load().len());
+            for (agent, name) in ["Claude", "Codex"].into_iter().enumerate() {
+                let found = projects::recent(agent);
+                println!(
+                    "{name} recent projects: {}{}",
+                    found.len(),
+                    found
+                        .first()
+                        .map(|project| format!(" (latest: {})", project.name))
+                        .unwrap_or_default()
+                );
+            }
             println!("Codex session samples: {}", codex::history().len());
             println!(
                 "Codex account limits: {}",
@@ -125,6 +138,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         runtime::Update::Finished(agent) => {
                             println!("Turn finished: {}", ["Claude", "Codex"][agent]);
+                        }
+                        runtime::Update::Projects([claude, codex]) => {
+                            println!(
+                                "Recent projects: Claude {}, Codex {}",
+                                claude.len(),
+                                codex.len()
+                            );
                         }
                         runtime::Update::Tokens(agent, minutes) => {
                             let now = usage::now();
@@ -224,6 +244,15 @@ fn desktop(demo: bool) -> Result<(), Box<dyn std::error::Error>> {
                 menu_focused: false,
                 menu_area: None,
                 settings_open: false,
+                menu_tab: 0,
+                compose: Default::default(),
+                compose_hover: None,
+                compose_rearm: false,
+                compose_area: None,
+                compose_typing: false,
+                compose_away: None,
+                compose_close_at: None,
+                projects: Default::default(),
                 tokens: Default::default(),
                 open_size: Vec2::new(96.0, 88.0),
                 home: None,
@@ -271,6 +300,22 @@ struct Companion {
     /// The menu and the cat, where the pointer keeps the menu open.
     menu_area: Option<[egui::Rect; 2]>,
     settings_open: bool,
+    /// The agent tab shown in the menu.
+    menu_tab: usize,
+    /// The task composer on the sleeping cat.
+    compose: panel::Compose,
+    /// Since when the pointer rests on the sleeping cat, to open the composer.
+    compose_hover: Option<f64>,
+    /// Closed while the pointer was on the cat: wait for it to leave before opening again.
+    compose_rearm: bool,
+    /// The composer and the cat, where the pointer keeps the composer open.
+    compose_area: Option<[egui::Rect; 2]>,
+    compose_typing: bool,
+    compose_away: Option<f64>,
+    /// After a task starts, the confirmation stays this long, then the composer closes.
+    compose_close_at: Option<f64>,
+    /// Recent project folders: Claude, then Codex.
+    projects: [Vec<projects::Project>; 2],
     /// Tokens per minute over the last eight days: Claude, then Codex.
     tokens: [Vec<(u64, u64)>; 2],
     open_size: Vec2,
@@ -483,6 +528,7 @@ impl eframe::App for Companion {
                     }
                     runtime::Update::Activity(sessions) => self.busy.sessions = sessions,
                     runtime::Update::Tokens(agent, minutes) => self.tokens[agent] = minutes,
+                    runtime::Update::Projects(found) => self.projects = found,
                     runtime::Update::Finished(_) => {
                         if self.settings.sound {
                             sound::play();
@@ -539,6 +585,28 @@ impl eframe::App for Companion {
                     bounds.right_bottom() - Vec2::new(96.0, 88.0),
                     Vec2::new(96.0, 88.0),
                 );
+                // Resting the pointer on the sleeping cat opens the task composer.
+                let clock = ui.input(|input| input.time);
+                let on_cat = ctx
+                    .pointer_hover_pos()
+                    .is_some_and(|pointer| cat_rect.contains(pointer));
+                if !on_cat {
+                    self.compose_rearm = false;
+                }
+                if !self.details && !working && !self.compose.open && on_cat && !self.compose_rearm
+                {
+                    let since = *self.compose_hover.get_or_insert(clock);
+                    if clock - since >= COMPOSE_DWELL {
+                        self.compose.open = true;
+                        self.compose.focus = true;
+                        self.compose.note = None;
+                        self.compose_hover = None;
+                    } else {
+                        ctx.request_repaint_after(Duration::from_millis(100));
+                    }
+                } else {
+                    self.compose_hover = None;
+                }
                 let window = if self.details {
                     let menu = panel::menu([
                         panel::row(
@@ -571,6 +639,7 @@ impl eframe::App for Companion {
                             &menu,
                             egui::pos2(bounds.right() - panel::MARGIN, cat_rect.top() + 4.0),
                             &mut self.settings_open,
+                            &mut self.menu_tab,
                             &self.settings,
                         );
                         // The pointer keeps the menu open only on the menu itself or the cat,
@@ -594,6 +663,41 @@ impl eframe::App for Companion {
                         }
                     }
                     window
+                } else if self.compose.open {
+                    let window = panel::compose_window(panel::compose_size());
+                    if bounds.width() >= window.x - 0.5 && bounds.height() >= window.y - 0.5 {
+                        let (area, typing, send) = panel::compose(
+                            ui,
+                            egui::pos2(bounds.right() - panel::MARGIN, cat_rect.top() + 4.0),
+                            &mut self.compose,
+                            &self.projects,
+                        );
+                        self.compose_area = Some([area, cat_rect]);
+                        self.compose_typing = typing;
+                        if let Some(folder) = send {
+                            let agent = self.compose.agent;
+                            match launch::start(agent, &folder, &self.compose.text) {
+                                Ok(()) => {
+                                    let name = ["Claude", "Codex"][agent];
+                                    let project = activity::folder_name(&folder.to_string_lossy());
+                                    self.compose.note = Some((
+                                        t!(
+                                            "Запущено: {name} · {project}",
+                                            "Запущено: {name} · {project}",
+                                            "Started: {name} · {project}"
+                                        ),
+                                        true,
+                                    ));
+                                    self.compose.text.clear();
+                                    self.compose_close_at = Some(clock + 1.8);
+                                }
+                                Err(failure) => {
+                                    self.compose.note = Some((failure.label(agent), false));
+                                }
+                            }
+                        }
+                    }
+                    window
                 } else {
                     let (window, clicked) = self.busy.strip(
                         ui,
@@ -604,8 +708,9 @@ impl eframe::App for Companion {
                         time,
                         self.offset,
                     );
-                    if clicked.is_some() {
-                        // A click on the bubble opens the menu.
+                    if let Some(agent) = clicked {
+                        // A click on the bubble opens the menu on that agent.
+                        self.menu_tab = agent;
                         self.details = true;
                         self.settings_open = false;
                         ctx.request_repaint();
@@ -656,13 +761,50 @@ impl eframe::App for Companion {
                     ctx.send_viewport_cmd(ViewportCommand::InnerSize(window));
                 }
                 // The cat sleeps only while every agent with data is blocked.
-                let awake = cat_awake(asleep, working, self.details, cat.hovered());
+                let awake = cat_awake(
+                    asleep,
+                    working,
+                    self.details || self.compose.open,
+                    cat.hovered(),
+                );
                 self.pet.draw(ui, cat_rect, awake);
                 if !awake {
                     let time = (!self.busy.reduced).then(|| ui.input(|input| input.time));
                     panel::sleep_zs(ui.painter(), cat_rect, time);
                 }
             });
+        // The composer closes on Escape, once a task has started, when the menu opens, when an
+        // agent starts working with nothing typed, or when the pointer leaves it empty-handed.
+        if self.compose.open {
+            let clock = ctx.input(|input| input.time);
+            let on = ctx.pointer_hover_pos().is_some_and(|pointer| {
+                self.compose_area
+                    .is_some_and(|areas| areas.iter().any(|area| area.contains(pointer)))
+            });
+            let empty = self.compose.text.trim().is_empty();
+            if on || self.compose_typing || !empty {
+                self.compose_away = None;
+            } else {
+                self.compose_away.get_or_insert(clock);
+            }
+            let close = ctx.input(|input| input.key_pressed(egui::Key::Escape))
+                || self.compose_away.is_some_and(|since| clock - since >= 1.2)
+                || self.compose_close_at.is_some_and(|at| clock >= at)
+                || self.details
+                || (working && empty);
+            if close {
+                self.compose.open = false;
+                self.compose.note = None;
+                self.compose_area = None;
+                self.compose_typing = false;
+                self.compose_away = None;
+                self.compose_close_at = None;
+                self.compose_rearm = true;
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+        }
         // An open menu nobody looks at closes itself: only the pointer resting on the menu or
         // the cat keeps it open. A click in another window closes it at once.
         if self.details {
@@ -721,6 +863,9 @@ fn spent(minutes: &[(u64, u64)], records: &[Record], now: u64) -> [Option<u64>; 
 /// first frame, and egui reports the old position until then. Resizing before it settles would
 /// anchor the cat to that stale corner and send it to the top left of the screen.
 const SETTLE_SECONDS: f64 = 0.8;
+
+/// How long the pointer rests on the sleeping cat before the task composer opens.
+const COMPOSE_DWELL: f64 = 0.6;
 
 /// The open panel closes after this long without the pointer on it.
 const PANEL_IDLE_SECONDS: f64 = 30.0;
