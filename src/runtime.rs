@@ -14,8 +14,6 @@ pub enum Update {
     Codex(Vec<Record>, bool),
     /// Busy sessions: Claude, then Codex.
     Activity([Vec<crate::activity::Session>; 2]),
-    /// The finished-turn history, after start and after each new turn.
-    Turns(Vec<crate::turns::Turn>),
     /// An agent (0 Claude, 1 Codex) just finished a turn.
     Finished(usize),
     /// Tokens an agent spent, per minute, over the last eight days.
@@ -26,9 +24,6 @@ pub fn start(ctx: eframe::egui::Context) -> Receiver<Update> {
     let busy = send.clone();
     let repaint = ctx.clone();
     thread::spawn(move || {
-        if busy.send(Update::Turns(crate::turns::load())).is_err() {
-            return;
-        }
         let mut last: Option<[Vec<crate::activity::Session>; 2]> = None;
         let mut recorded = std::collections::HashSet::new();
         let mut deepened = std::collections::HashSet::new();
@@ -64,7 +59,7 @@ pub fn start(ctx: eframe::egui::Context) -> Receiver<Update> {
                 }
                 // A session that stopped being busy finished its turn: remember how it went.
                 // shortcut: turns that finish while Void is closed are not recorded.
-                let (mut saved, mut finished) = (false, Vec::new());
+                let mut finished = Vec::new();
                 for (agent, before) in previous.iter().enumerate() {
                     for gone in before
                         .iter()
@@ -75,7 +70,7 @@ pub fn start(ctx: eframe::egui::Context) -> Receiver<Update> {
                             && recorded.insert((gone.id.clone(), gone.since))
                         {
                             finished.push(agent);
-                            saved |= crate::turns::save(&crate::turns::Turn {
+                            let _ = crate::turns::save(&crate::turns::Turn {
                                 agent,
                                 project: turn.project,
                                 start: gone.since,
@@ -90,9 +85,6 @@ pub fn start(ctx: eframe::egui::Context) -> Receiver<Update> {
                     .into_iter()
                     .any(|agent| busy.send(Update::Finished(agent)).is_err())
                 {
-                    break;
-                }
-                if saved && busy.send(Update::Turns(crate::turns::load())).is_err() {
                     break;
                 }
             }

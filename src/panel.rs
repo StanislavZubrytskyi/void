@@ -92,11 +92,10 @@ fn regular(size: f32) -> FontId {
 pub struct Quota {
     pub name: &'static str,
     pub remaining: Option<f32>,
-    pub value: String,
     pub reset: String,
 }
 /// Both quota windows of one provider, as the panel and the agent card show them.
-pub fn quotas(records: &[Record], estimated: bool, now: u64, offset: i64) -> Vec<Quota> {
+pub fn quotas(records: &[Record], now: u64, offset: i64) -> Vec<Quota> {
     advice::windows()
         .iter()
         .map(|(name, select)| {
@@ -112,15 +111,6 @@ pub fn quotas(records: &[Record], estimated: bool, now: u64, offset: i64) -> Vec
                     Quota {
                         name,
                         remaining: Some(left as f32 / 100.0),
-                        value: format!(
-                            "{}{}",
-                            if estimated { "≈ " } else { "" },
-                            t!(
-                                "{left:.0}% лишилось",
-                                "{left:.0}% осталось",
-                                "{left:.0}% left"
-                            )
-                        ),
                         reset: if limit.resets_at == 0 {
                             s("Час невідомий", "Время неизвестно", "Time unknown").into()
                         } else {
@@ -131,16 +121,6 @@ pub fn quotas(records: &[Record], estimated: bool, now: u64, offset: i64) -> Vec
                 None => Quota {
                     name,
                     remaining: None,
-                    value: latest
-                        .map(|(limit, _)| {
-                            let left = 100.0 - limit.used_percentage;
-                            t!(
-                                "{left:.0}% лишалось",
-                                "{left:.0}% оставалось",
-                                "{left:.0}% was left"
-                            )
-                        })
-                        .unwrap_or_else(|| s("Невідомо", "Неизвестно", "Unknown").into()),
                     reset: if latest.is_some() {
                         s(
                             "Очікую оновлення",
@@ -201,7 +181,7 @@ pub fn row(
     now: u64,
     offset: i64,
 ) -> Row {
-    let windows = quotas(records, false, now, offset);
+    let windows = quotas(records, now, offset);
     let tighter = windows
         .iter()
         .filter(|quota| quota.remaining.is_some())
@@ -773,82 +753,27 @@ fn tool_name(tool: &str) -> &str {
     tool.rsplit("__").next().unwrap_or(tool)
 }
 
-/// Roughly how many characters of the prompt fit one line of the card.
-const PROMPT_LINE: usize = 40;
-const LINE: f32 = 15.0;
+const SESSION_ROW: f32 = 40.0;
 
-/// The prompt on one line of text, cut to two card lines; and how many lines it takes.
-fn prompt_preview(prompt: &str) -> (String, usize) {
-    let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    let limit = PROMPT_LINE * 2 - 3;
-    let text = if flat.chars().count() > limit {
-        format!(
-            "«{}…»",
-            flat.chars().take(limit - 1).collect::<String>().trim_end()
-        )
-    } else {
-        format!("«{flat}»")
-    };
-    let lines = text.chars().count().div_ceil(PROMPT_LINE).clamp(1, 2);
-    (text, lines)
-}
-
-fn row_height(session: &crate::activity::Session, prediction: bool) -> f32 {
-    let prompt = session
-        .prompt
-        .as_deref()
-        .filter(|prompt| !prompt.trim().is_empty())
-        .map_or(0, |prompt| prompt_preview(prompt).1);
-    18.0 + prompt as f32 * LINE + 16.0 + if prediction { LINE } else { 0.0 } + 12.0
-}
-
-/// "18,4 тис. токенів", "18,4 тыс. токенов" or "18.4k tokens".
-pub fn tokens_text(tokens: u64) -> String {
-    let comma = |text: String| match crate::i18n::lang() {
-        crate::i18n::Lang::En => text,
-        _ => text.replace('.', ","),
-    };
-    if tokens >= 1_000_000 {
-        let m = comma(format!("{:.2}", tokens as f64 / 1e6));
-        t!("{m} млн токенів", "{m} млн токенов", "{m}M tokens")
-    } else if tokens >= 1000 {
-        let k = comma(format!("{:.1}", tokens as f64 / 1e3));
-        t!("{k} тис. токенів", "{k} тыс. токенов", "{k}k tokens")
-    } else {
-        t!("{tokens} токенів", "{tokens} токенов", "{tokens} tokens")
-    }
-}
-
-pub fn busy_card_size(
-    sessions: &[crate::activity::Session],
-    predictions: &[Option<String>],
-    hint: bool,
-) -> Vec2 {
-    let rows: f32 = sessions
-        .iter()
-        .take(BUSY_ROWS)
-        .enumerate()
-        .map(|(i, session)| row_height(session, predictions.get(i).is_some_and(Option::is_some)))
-        .sum();
+/// Height of the hover card: a header, one line per session, and the quota line.
+pub fn busy_card_size(sessions: &[crate::activity::Session]) -> Vec2 {
+    let rows = sessions.len().min(BUSY_ROWS) as f32;
     let more = if sessions.len() > BUSY_ROWS {
         18.0
     } else {
         0.0
     };
-    let footer = if hint { 90.0 } else { 70.0 };
-    Vec2::new(BUSY_WIDTH, 44.0 + rows + more + footer)
+    Vec2::new(BUSY_WIDTH, 40.0 + rows * SESSION_ROW + more + 34.0)
 }
 
-/// What the hovered agent is doing: one row per busy session and the quota in one line.
-#[allow(clippy::too_many_arguments)]
+/// One line per session of work: the project and how long it has run, then the step the agent
+/// is on. The quota sits underneath. The menu holds the details; the card stays quiet.
 pub fn busy_card(
     painter: &egui::Painter,
     rect: Rect,
     agent: usize,
     sessions: &[crate::activity::Session],
-    predictions: &[Option<String>],
     quotas: &[Quota],
-    hint: Option<&str>,
     now: u64,
     time: Option<f64>,
 ) {
@@ -892,24 +817,24 @@ pub fn busy_card(
         strong(13.5),
         LABEL,
     );
-    painter.text(
-        Pos2::new(right, y + 2.0),
-        egui::Align2::RIGHT_TOP,
-        format!("{} {}", sessions.len(), sessions_word(sessions.len())),
-        regular(10.5),
-        SECONDARY,
-    );
+    if sessions.len() > 1 {
+        painter.text(
+            Pos2::new(right, y + 2.0),
+            egui::Align2::RIGHT_TOP,
+            format!("{} {}", sessions.len(), sessions_word(sessions.len())),
+            regular(10.5),
+            SECONDARY,
+        );
+    }
     y += 30.0;
-    for (i, session) in sessions.iter().take(BUSY_ROWS).enumerate() {
+    for session in sessions.iter().take(BUSY_ROWS) {
         let project = if session.project.is_empty() {
             s("Без назви", "Без названия", "Untitled")
         } else {
             &session.project
         };
-        let prediction = predictions.get(i).cloned().flatten();
-        let height = row_height(session, prediction.is_some());
-        let time = painter.layout_no_wrap(elapsed(session.since, now), regular(11.0), SECONDARY);
-        let room = right - left - time.size().x - 10.0;
+        let since = painter.layout_no_wrap(elapsed(session.since, now), regular(11.0), SECONDARY);
+        let room = right - left - since.size().x - 10.0;
         let title = painter.layout(project.to_owned(), strong(12.0), LABEL, room);
         // One line only: long folder names are clipped by the width, not wrapped.
         let title_row = title.rows.first().map_or(0.0, |row| row.height());
@@ -919,51 +844,22 @@ pub fn busy_card(
                 Vec2::new(room, title_row),
             ))
             .galley(Pos2::new(left, y), title, LABEL);
-        painter.galley(Pos2::new(right - time.size().x, y + 1.0), time, SECONDARY);
-        let mut line = y + 18.0;
-        // What was asked, in the user's own words: the reason this turn exists.
-        if let Some(prompt) = session.prompt.as_deref().filter(|p| !p.trim().is_empty()) {
-            let (text, lines) = prompt_preview(prompt);
-            let galley = painter.layout(text, regular(11.0), Color32::from_gray(222), right - left);
-            painter
-                .with_clip_rect(Rect::from_min_size(
-                    Pos2::new(left, line),
-                    Vec2::new(right - left, lines as f32 * LINE),
-                ))
-                .galley(Pos2::new(left, line), galley, Color32::from_gray(222));
-            line += lines as f32 * LINE;
-        }
-        let doing = session.tool.as_deref().map_or_else(
+        painter.galley(Pos2::new(right - since.size().x, y + 1.0), since, SECONDARY);
+        let step = session.tool.as_deref().map_or_else(
             || s("думає", "думает", "thinking").to_owned(),
             |tool| {
                 let tool = tool_name(tool);
                 t!("виконує {tool}", "выполняет {tool}", "running {tool}")
             },
         );
-        let status = if session.tokens > 0 {
-            format!("{doing} · {}", tokens_text(session.tokens))
-        } else {
-            doing
-        };
         painter.text(
-            Pos2::new(left, line + 1.0),
+            Pos2::new(left, y + 18.0),
             egui::Align2::LEFT_TOP,
-            status,
+            step,
             regular(10.5),
             SECONDARY,
         );
-        line += 16.0;
-        // A forecast only once there is history to build it from.
-        if let Some(forecast) = prediction {
-            painter.text(
-                Pos2::new(left, line),
-                egui::Align2::LEFT_TOP,
-                forecast,
-                regular(10.5),
-                color.gamma_multiply(0.85),
-            );
-        }
-        y += height;
+        y += SESSION_ROW;
     }
     if sessions.len() > BUSY_ROWS {
         painter.text(
@@ -984,48 +880,22 @@ pub fn busy_card(
         [Pos2::new(left, y + 2.0), Pos2::new(right, y + 2.0)],
         Stroke::new(1.0, Color32::from_white_alpha(20)),
     );
-    // Both limits side by side, like the panel: what is left, a bar, and when it resets.
-    let gap = 12.0;
-    let column = (right - left - gap) / 2.0;
-    for (i, quota) in quotas.iter().take(2).enumerate() {
-        let x = left + i as f32 * (column + gap);
-        painter.text(
-            Pos2::new(x, y + 10.0),
-            egui::Align2::LEFT_TOP,
-            quota.name,
-            regular(10.0),
-            SECONDARY,
-        );
-        painter.text(
-            Pos2::new(x, y + 23.0),
-            egui::Align2::LEFT_TOP,
-            &quota.value,
-            strong(11.5),
-            LABEL,
-        );
-        let track = Rect::from_min_size(Pos2::new(x, y + 41.0), Vec2::new(column, 3.0));
-        painter.rect_filled(track, 2.0, Color32::from_white_alpha(25));
-        if let Some(share) = quota.remaining.filter(|share| *share > 0.0) {
-            let fill = Rect::from_min_size(track.min, Vec2::new(track.width() * share, 3.0));
-            painter.rect_filled(fill, 2.0, color);
-        }
-        painter.text(
-            Pos2::new(x, y + 48.0),
-            egui::Align2::LEFT_TOP,
-            &quota.reset,
-            regular(9.5),
-            SECONDARY,
-        );
-    }
-    if let Some(hint) = hint {
-        painter.text(
-            Pos2::new(left, y + 66.0),
-            egui::Align2::LEFT_TOP,
-            format!("→ {hint}"),
-            strong(11.0),
-            LABEL,
-        );
-    }
+    // Both limits as numbers only: the menu explains what they mean and when they reset.
+    let quota = quotas
+        .iter()
+        .map(|quota| match quota.remaining {
+            Some(share) => format!("{} {:.0}%", quota.name, share * 100.0),
+            None => format!("{} —", quota.name),
+        })
+        .collect::<Vec<_>>()
+        .join("   ·   ");
+    painter.text(
+        Pos2::new(left, y + 10.0),
+        egui::Align2::LEFT_TOP,
+        quota,
+        regular(10.5),
+        SECONDARY,
+    );
 }
 
 #[cfg(test)]
@@ -1042,38 +912,22 @@ mod tests {
         assert_eq!(elapsed(1000, 1030), "щойно");
         assert_eq!(elapsed(0, 65 * 60), "1 год 05 хв");
         assert_eq!(tool_name("mcp__github__create_issue"), "create_issue");
-        let session = |prompt: Option<&str>| crate::activity::Session {
+        let session = || crate::activity::Session {
             id: Default::default(),
             project: "p".into(),
             since: 0,
             tool: None,
             busy: true,
             end: 0,
-            prompt: prompt.map(Into::into),
+            prompt: None,
             tokens: 0,
         };
-        let five: Vec<_> = (0..5).map(|_| session(None)).collect();
-        assert_eq!(
-            busy_card_size(&five, &[], false).y,
-            busy_card_size(&five[..3], &[], false).y + 18.0
-        );
-        let one = [session(None)];
-        assert_eq!(
-            busy_card_size(&one, &[], true).y,
-            busy_card_size(&one, &[], false).y + 20.0
-        );
-        // A long prompt takes two lines, a forecast one more.
-        let asked = [session(Some(&"word ".repeat(60)))];
-        assert_eq!(
-            busy_card_size(&asked, &[Some("x".into())], false).y,
-            busy_card_size(&one, &[], false).y + 3.0 * LINE
-        );
-        let (text, lines) = prompt_preview("fix\n  the   login");
-        assert_eq!((text.as_str(), lines), ("«fix the login»", 1));
-        assert_eq!(tokens_text(18_400), "18,4 тис. токенів");
-        assert_eq!(tokens_text(950), "950 токенів");
+        let five: Vec<_> = (0..5).map(|_| session()).collect();
+        let three: Vec<_> = (0..3).map(|_| session()).collect();
+        assert_eq!(busy_card_size(&five).y, busy_card_size(&three).y + 18.0);
+        assert_eq!(busy_card_size(&three).y, 40.0 + 3.0 * SESSION_ROW + 34.0);
         let now = 1_800_000_000;
-        let windows = quotas(&crate::demo_codex_history(now), false, now, 0);
+        let windows = quotas(&crate::demo_codex_history(now), now, 0);
         assert_eq!(
             windows.iter().map(|q| q.name).collect::<Vec<_>>(),
             ["5 год", "7 днів"]

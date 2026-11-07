@@ -123,9 +123,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 codex.len()
                             );
                         }
-                        runtime::Update::Turns(history) => {
-                            println!("Finished turns remembered: {}", history.len());
-                        }
                         runtime::Update::Finished(agent) => {
                             println!("Turn finished: {}", ["Claude", "Codex"][agent]);
                         }
@@ -244,8 +241,6 @@ fn desktop(demo: bool) -> Result<(), Box<dyn std::error::Error>> {
                     hover: None,
                     shown: None,
                     away: None,
-                    turns: Vec::new(),
-                    predictions: Default::default(),
                     reduced: std::env::var_os("VOID_REDUCED_MOTION").is_some(),
                 },
             }))
@@ -302,10 +297,6 @@ struct Busy {
     /// When the pointer was last reported gone while a card was open.
     away: Option<f64>,
     reduced: bool,
-    /// Finished turns, for predictions and advice.
-    turns: Vec<turns::Turn>,
-    /// Per running turn (transcript, start): predicting reads every stored prompt, so once.
-    predictions: std::collections::HashMap<(std::path::PathBuf, u64), Option<turns::Prediction>>,
 }
 
 impl Busy {
@@ -318,7 +309,6 @@ impl Busy {
         ctx: &egui::Context,
         bounds: egui::Rect,
         cat: egui::Rect,
-        statuses: [&Status; 2],
         records: [&[Record]; 2],
         now: u64,
         offset: i64,
@@ -397,29 +387,7 @@ impl Busy {
         let Some(agent) = hover else {
             return (closed, clicked);
         };
-        let predictions: Vec<Option<String>> = self.sessions[agent]
-            .iter()
-            .map(|session| {
-                self.predictions
-                    .entry((session.id.clone(), session.since))
-                    .or_insert_with(|| {
-                        turns::predict(
-                            &self.turns,
-                            agent,
-                            &session.project,
-                            session.prompt.as_deref(),
-                            records[agent],
-                        )
-                    })
-                    .as_ref()
-                    .map(|prediction| {
-                        turns::describe(prediction, now.saturating_sub(session.since) as f64 / 60.0)
-                    })
-            })
-            .collect();
-        let left = [0, 1].map(|other| turns::turns_left(&self.turns, other, records[other], now));
-        let hint = turns::hint(agent, left, statuses);
-        let size = panel::busy_card_size(&self.sessions[agent], &predictions, hint.is_some());
+        let size = panel::busy_card_size(&self.sessions[agent]);
         let window = Vec2::new(
             (size.x + panel::MARGIN * 2.0).max(closed.x),
             88.0 + panel::STRIP + 6.0 + size.y + panel::MARGIN,
@@ -438,9 +406,7 @@ impl Busy {
                 card,
                 agent,
                 &self.sessions[agent],
-                &predictions,
-                &panel::quotas(records[agent], false, now, offset),
-                hint.as_deref(),
+                &panel::quotas(records[agent], now, offset),
                 now,
                 time,
             );
@@ -517,10 +483,6 @@ impl eframe::App for Companion {
                         if self.settings.sound {
                             sound::play();
                         }
-                    }
-                    runtime::Update::Turns(history) => {
-                        self.busy.turns = history;
-                        self.busy.predictions.clear();
                     }
                 }
             }
@@ -641,7 +603,6 @@ impl eframe::App for Companion {
                         ctx,
                         bounds,
                         cat_rect,
-                        [&claude_status, &codex_status],
                         [claude, &self.codex_records],
                         time,
                         self.offset,
