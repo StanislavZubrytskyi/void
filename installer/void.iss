@@ -3,7 +3,7 @@
 #define AppVersion "0.1.0"
 
 [Setup]
-AppId={{6F0B7C1E-2D4A-4C5B-9E3A-C1A3D1E5F0A7}
+AppId={{386CCC0E-4621-4CC6-AFE3-8BBE85DC196A}
 AppName=Void
 AppVersion={#AppVersion}
 AppPublisher=ZUBRYTSKYI

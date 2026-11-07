@@ -26,7 +26,11 @@ fn previous_path() -> io::Result<PathBuf> {
 fn is_ours(line: &Value) -> bool {
     line.get("command")
         .and_then(Value::as_str)
-        .is_some_and(|command| command.to_ascii_lowercase().contains("void"))
+        .is_some_and(|command| {
+            // Also the Clawdle line this app replaces, so uninstalling never restores it.
+            let command = command.to_ascii_lowercase();
+            command.contains("void") || command.contains("clawdle")
+        })
 }
 
 fn read_settings(path: &Path) -> Result<Value, Box<dyn Error>> {
