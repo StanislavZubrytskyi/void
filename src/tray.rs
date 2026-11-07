@@ -193,13 +193,23 @@ unsafe fn show_menu(hwnd: HWND) {
         if menu.is_null() {
             return;
         }
-        let toggle = if IsWindowVisible(hwnd) != 0 {
-            windows_sys::core::w!("Сховати кота")
+        use crate::i18n::s;
+        // Menu labels follow the interface language, so they are built at runtime.
+        let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let toggle = wide(if IsWindowVisible(hwnd) != 0 {
+            s("Сховати кота", "Спрятать кота", "Hide the cat")
         } else {
-            windows_sys::core::w!("Показати кота")
-        };
+            s("Показати кота", "Показать кота", "Show the cat")
+        });
+        let startup = wide(s(
+            "Запускати з Windows",
+            "Запускать с Windows",
+            "Start with Windows",
+        ));
+        let alerts = wide(s("Сповіщення", "Уведомления", "Notifications"));
+        let quit = wide(s("Вийти з Void", "Выйти из Void", "Quit Void"));
         let autostart = autostart_enabled();
-        AppendMenuW(menu, MF_STRING, 1, toggle);
+        AppendMenuW(menu, MF_STRING, 1, toggle.as_ptr());
         AppendMenuW(
             menu,
             if autostart {
@@ -208,7 +218,7 @@ unsafe fn show_menu(hwnd: HWND) {
                 MF_STRING
             },
             3,
-            windows_sys::core::w!("Запускати з Windows"),
+            startup.as_ptr(),
         );
         let notifications = notifications_enabled();
         AppendMenuW(
@@ -219,9 +229,9 @@ unsafe fn show_menu(hwnd: HWND) {
                 MF_STRING
             },
             4,
-            windows_sys::core::w!("Сповіщення"),
+            alerts.as_ptr(),
         );
-        AppendMenuW(menu, MF_STRING, 2, windows_sys::core::w!("Вийти з Void"));
+        AppendMenuW(menu, MF_STRING, 2, quit.as_ptr());
         let mut point = POINT::default();
         GetCursorPos(&mut point);
         SetForegroundWindow(hwnd);

@@ -1,5 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+#[macro_use]
+mod i18n;
 mod activity;
 mod advice;
 mod claude;
@@ -8,6 +10,8 @@ mod estimate;
 mod panel;
 mod pet;
 mod runtime;
+mod settings;
+mod sound;
 mod statusline;
 #[cfg(windows)]
 mod tray;
@@ -122,6 +126,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         runtime::Update::Turns(history) => {
                             println!("Finished turns remembered: {}", history.len());
                         }
+                        runtime::Update::Finished(agent) => {
+                            println!("Turn finished: {}", ["Claude", "Codex"][agent]);
+                        }
+                        runtime::Update::Tokens(agent, minutes) => {
+                            let now = usage::now();
+                            let sum = |span: u64| -> u64 {
+                                minutes
+                                    .iter()
+                                    .filter(|(at, _)| *at + span >= now)
+                                    .map(|(_, tokens)| tokens)
+                                    .sum()
+                            };
+                            println!(
+                                "{} tokens: {} in 5 h, {} in 7 days",
+                                ["Claude", "Codex"][agent],
+                                sum(5 * 3600),
+                                sum(7 * 86_400)
+                            );
+                        }
                     }
                 }
             }
@@ -180,11 +203,14 @@ fn desktop(demo: bool) -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         },
         Box::new(move |cc| {
+            let settings = settings::load();
+            i18n::set(settings.language);
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             panel::install_fonts(&cc.egui_ctx);
             Ok(Box::new(Companion {
                 demo,
                 pet: pet::Pet::load(&cc.egui_ctx),
+                settings,
                 #[cfg(windows)]
                 tray: tray::Tray::install(cc),
                 records: Vec::new(),
@@ -198,7 +224,10 @@ fn desktop(demo: bool) -> Result<(), Box<dyn std::error::Error>> {
                 updated: None,
                 details: false,
                 details_seen: None,
-                selected_provider: 0,
+                menu_focused: false,
+                menu_area: None,
+                settings_open: false,
+                tokens: Default::default(),
                 open_size: Vec2::new(96.0, 88.0),
                 home: None,
                 shift: Vec2::ZERO,
@@ -242,7 +271,13 @@ struct Companion {
     details: bool,
     /// Last moment the open panel had the pointer on it.
     details_seen: Option<f64>,
-    selected_provider: usize,
+    /// The open menu has had keyboard focus, so losing it means a click elsewhere.
+    menu_focused: bool,
+    /// The menu and the cat, where the pointer keeps the menu open.
+    menu_area: Option<[egui::Rect; 2]>,
+    settings_open: bool,
+    /// Tokens per minute over the last eight days: Claude, then Codex.
+    tokens: [Vec<(u64, u64)>; 2],
     open_size: Vec2,
     /// Where the cat's bottom-right corner lives when nothing is open.
     home: Option<Pos2>,
@@ -253,6 +288,7 @@ struct Companion {
     notified: HashSet<(String, u64)>,
     blocked_before: [Option<u64>; 2],
     busy: Busy,
+    settings: settings::Settings,
 }
 
 /// Working sessions above the closed cat: Claude, then Codex.
@@ -383,7 +419,7 @@ impl Busy {
             .collect();
         let left = [0, 1].map(|other| turns::turns_left(&self.turns, other, records[other], now));
         let hint = turns::hint(agent, left, statuses);
-        let size = panel::busy_card_size(self.sessions[agent].len(), hint.is_some());
+        let size = panel::busy_card_size(&self.sessions[agent], &predictions, hint.is_some());
         let window = Vec2::new(
             (size.x + panel::MARGIN * 2.0).max(closed.x),
             88.0 + panel::STRIP + 6.0 + size.y + panel::MARGIN,
@@ -403,7 +439,7 @@ impl Busy {
                 agent,
                 &self.sessions[agent],
                 &predictions,
-                &quota_line(statuses[agent], now, offset),
+                &panel::quotas(records[agent], false, now, offset),
                 hint.as_deref(),
                 now,
                 time,
@@ -476,6 +512,12 @@ impl eframe::App for Companion {
                         self.codex_online = online;
                     }
                     runtime::Update::Activity(sessions) => self.busy.sessions = sessions,
+                    runtime::Update::Tokens(agent, minutes) => self.tokens[agent] = minutes,
+                    runtime::Update::Finished(agent) => {
+                        if self.settings.sound {
+                            sound::play(agent);
+                        }
+                    }
                     runtime::Update::Turns(history) => {
                         self.busy.turns = history;
                         self.busy.predictions.clear();
@@ -530,35 +572,67 @@ impl eframe::App for Companion {
                     Vec2::new(96.0, 88.0),
                 );
                 let window = if self.details {
-                    let bubble = panel::layout([
-                        panel::agent(
-                            "Claude",
-                            &claude_status,
-                            claude,
-                            false,
-                            self.claude_failure.map(|failure| failure.label()),
-                            time,
-                            self.offset,
-                        ),
-                        panel::agent(
-                            "Codex",
-                            &codex_status,
-                            &self.codex_records,
-                            false,
-                            (!self.codex_online).then_some("Немає зв’язку · повторюю підключення"),
-                            time,
-                            self.offset,
-                        ),
-                    ]);
-                    let window = panel::window_size(&bubble);
+                    let speech = advice::speech(
+                        [("Claude", &claude_status), ("Codex", &codex_status)],
+                        time,
+                        self.offset,
+                    );
+                    let menu = panel::menu(
+                        speech.title,
+                        speech.detail,
+                        [
+                            panel::row(
+                                0,
+                                &claude_status,
+                                claude,
+                                self.claude_failure.map(|failure| failure.label()),
+                                spent(&self.tokens[0], claude, time),
+                                time,
+                                self.offset,
+                            ),
+                            panel::row(
+                                1,
+                                &codex_status,
+                                &self.codex_records,
+                                (!self.codex_online).then_some(i18n::s(
+                                    "Немає зв’язку · повторюю підключення",
+                                    "Нет связи · переподключаюсь",
+                                    "No connection · reconnecting",
+                                )),
+                                spent(&self.tokens[1], &self.codex_records, time),
+                                time,
+                                self.offset,
+                            ),
+                        ],
+                    );
+                    let window = panel::window_size(&menu);
                     if bounds.width() >= window.x - 0.5 && bounds.height() >= window.y - 0.5 {
-                        panel::draw(
+                        let (area, action) = panel::draw(
                             ui,
-                            &bubble,
+                            &menu,
                             egui::pos2(bounds.right() - panel::MARGIN, cat_rect.top() + 4.0),
-                            cat_rect.center().x,
-                            &mut self.selected_provider,
+                            &mut self.settings_open,
+                            &self.settings,
                         );
+                        // The pointer keeps the menu open only on the menu itself or the cat,
+                        // not on the transparent rest of the window.
+                        self.menu_area = Some([area, cat_rect]);
+                        match action {
+                            Some(panel::Action::Language(lang)) => {
+                                self.settings.language = lang;
+                                i18n::set(lang);
+                                let _ = settings::save(&self.settings);
+                            }
+                            Some(panel::Action::Sound(on)) => {
+                                self.settings.sound = on;
+                                let _ = settings::save(&self.settings);
+                                if on {
+                                    sound::play(0);
+                                }
+                            }
+                            Some(panel::Action::Preview) => sound::play(0),
+                            None => {}
+                        }
                     }
                     window
                 } else {
@@ -572,10 +646,10 @@ impl eframe::App for Companion {
                         time,
                         self.offset,
                     );
-                    if let Some(agent) = clicked {
-                        // The full panel opens on the agent whose chip was clicked.
+                    if clicked.is_some() {
+                        // A click on the bubble opens the menu.
                         self.details = true;
-                        self.selected_provider = agent;
+                        self.settings_open = false;
                         ctx.request_repaint();
                     }
                     window
@@ -627,21 +701,58 @@ impl eframe::App for Companion {
                 self.pet
                     .draw(ui, cat_rect, !asleep || self.details || cat.hovered());
             });
-        // An open panel nobody looks at closes itself: the pointer resting on it keeps it open.
+        // An open menu nobody looks at closes itself: only the pointer resting on the menu or
+        // the cat keeps it open. A click in another window closes it at once.
         if self.details {
             let clock = ctx.input(|input| input.time);
             let seen = *self.details_seen.get_or_insert(clock);
-            if ctx.pointer_hover_pos().is_some() {
+            let focused = ctx.input(|input| input.focused);
+            let on_menu = ctx.pointer_hover_pos().is_some_and(|pointer| {
+                self.menu_area
+                    .is_some_and(|areas| areas.iter().any(|area| area.contains(pointer)))
+            });
+            if on_menu {
                 self.details_seen = Some(clock);
-            } else if clock - seen >= PANEL_IDLE_SECONDS {
+            }
+            if focused {
+                self.menu_focused = true;
+            }
+            if (self.menu_focused && !focused) || clock - seen >= PANEL_IDLE_SECONDS {
                 self.details = false;
                 ctx.request_repaint();
             }
+            ctx.request_repaint_after(Duration::from_millis(500));
         } else {
             self.details_seen = None;
+            self.menu_focused = false;
+            self.menu_area = None;
+            self.settings_open = false;
         }
         ctx.request_repaint_after(Duration::from_secs(1));
     }
+}
+
+/// Tokens spent in the current five-hour and weekly quota windows; rolling windows when the
+/// reset time is unknown.
+fn spent(minutes: &[(u64, u64)], records: &[Record], now: u64) -> [Option<u64>; 2] {
+    if minutes.is_empty() {
+        return [None; 2];
+    }
+    let windows = advice::windows();
+    [(windows[0].1, 5 * 3600), (windows[1].1, 7 * 86_400)].map(|(select, span)| {
+        let from = usage::last_window(records, select)
+            .filter(|(limit, _)| limit.resets_at > now)
+            .map_or(now.saturating_sub(span), |(limit, _)| {
+                limit.resets_at.saturating_sub(span)
+            });
+        Some(
+            minutes
+                .iter()
+                .filter(|(at, _)| *at + 60 > from)
+                .map(|(_, tokens)| tokens)
+                .sum(),
+        )
+    })
 }
 
 /// The open panel closes after this long without the pointer on it.
@@ -665,6 +776,11 @@ fn alerts(
     let mut messages = Vec::new();
     for (i, (name, status, records)) in agents.into_iter().enumerate() {
         let now_blocked = status.blocked.map(|(_, reset)| reset);
+        let back = t!(
+            "{name} знову доступний",
+            "{name} снова доступен",
+            "{name} is available again"
+        );
         if let Some(reset) = blocked_before[i]
             && now_blocked.is_none()
             && time >= reset
@@ -672,7 +788,7 @@ fn alerts(
             && records.iter().any(|row| {
                 row.time >= reset
                     && row.time <= time
-                    && advice::WINDOWS.iter().any(|(_, select)| {
+                    && advice::windows().iter().any(|(_, select)| {
                         row.sample
                             .rate_limits
                             .as_ref()
@@ -684,37 +800,43 @@ fn alerts(
             })
         {
             messages.push((
-                format!("{name} знову доступний"),
-                "Можна продовжувати роботу.".to_owned(),
+                back.clone(),
+                i18n::s(
+                    "Можна продовжувати роботу.",
+                    "Можно продолжать работу.",
+                    "You can continue working.",
+                )
+                .to_owned(),
             ));
         }
-        blocked_before[i] = if now_blocked.is_none()
-            && !messages
-                .iter()
-                .any(|(title, _)| title == &format!("{name} знову доступний"))
-        {
-            blocked_before[i]
-        } else {
-            now_blocked
-        };
+        blocked_before[i] =
+            if now_blocked.is_none() && !messages.iter().any(|(title, _)| title == &back) {
+                blocked_before[i]
+            } else {
+                now_blocked
+            };
         if let Some(risk) = &status.risk
             && risk.minutes <= 30.0
             && notified.insert((format!("{name} risk"), risk.reset_at))
         {
             messages.push((
-                format!(
+                t!(
                     "{name}: ≈ {} до ліміту {}",
+                    "{name}: ≈ {} до лимита {}",
+                    "{name}: ≈ {} to the {} limit",
                     duration(risk.minutes),
                     risk.window
                 ),
-                format!(
+                t!(
                     "Закінчиться {}, оновлення {}.",
+                    "Закончится {}, обновление {}.",
+                    "Runs out {}, resets {}.",
                     advice::clock(time + (risk.minutes * 60.0) as u64, time, offset),
                     advice::clock(risk.reset_at, time, offset)
                 ),
             ));
         }
-        if let Some((limit, seen)) = usage::last_window(records, advice::WINDOWS[1].1)
+        if let Some((limit, seen)) = usage::last_window(records, advice::windows()[1].1)
             && time.saturating_sub(seen) <= 1800
             && limit.used_percentage >= 80.0
             && limit.used_percentage < 100.0
@@ -722,12 +844,16 @@ fn alerts(
             && notified.insert((format!("{name} week"), limit.resets_at))
         {
             messages.push((
-                format!(
+                t!(
                     "{name}: тиждень використано на {:.0}%",
+                    "{name}: неделя израсходована на {:.0}%",
+                    "{name}: {:.0}% of the week used",
                     limit.used_percentage
                 ),
-                format!(
+                t!(
                     "Оновлення {}. Розподіли ≈ {:.0}% на день.",
+                    "Обновление {}. Распредели ≈ {:.0}% в день.",
+                    "Resets {}. Spread ≈ {:.0}% a day.",
                     advice::clock(limit.resets_at, time, offset),
                     advice::per_day(limit, time)
                 ),
@@ -737,34 +863,28 @@ fn alerts(
     messages
 }
 
-/// The quota in one line under the busy card.
-fn quota_line(status: &Status, now: u64, offset: i64) -> String {
-    if let Some((_, reset)) = status.blocked {
-        format!("Квота на паузі до {}", advice::hhmm(reset, offset))
-    } else if let Some(risk) = &status.risk {
-        format!("Ліміт {} ≈ через {}", risk.window, duration(risk.minutes))
-    } else if let Some((_, _, _, reset)) = status.lasting {
-        format!(
-            "Квоти вистачить {}",
-            advice::clock(reset, now, offset).replacen("о ", "до ", 1)
-        )
-    } else if let Some(used) = status.used {
-        format!("Квота: {:.0}% лишилось", (100.0 - used).max(0.0))
-    } else {
-        "Квота: ще немає даних".into()
-    }
-}
-
 fn duration(minutes: f64) -> String {
     let minutes = minutes.round() as u64;
     if minutes >= 1440 {
         // Round to whole hours first, so 23.5 h never shows up as "24 год".
         let hours = minutes.div_ceil(60);
-        format!("{} дн {} год", hours / 24, hours % 24)
+        t!(
+            "{} дн {} год",
+            "{} д {} ч",
+            "{}d {}h",
+            hours / 24,
+            hours % 24
+        )
     } else if minutes >= 60 {
-        format!("{} год {:02} хв", minutes / 60, minutes % 60)
+        t!(
+            "{} год {:02} хв",
+            "{} ч {:02} мин",
+            "{}h {:02}m",
+            minutes / 60,
+            minutes % 60
+        )
     } else {
-        format!("{minutes} хв")
+        t!("{minutes} хв", "{minutes} мин", "{minutes} min")
     }
 }
 
@@ -793,6 +913,7 @@ fn demo_busy(time: u64) -> [Vec<activity::Session>; 2] {
         busy: true,
         end: time,
         prompt: Some(format!("demo task in {project}")),
+        tokens: minutes * 1500,
     };
     [
         vec![

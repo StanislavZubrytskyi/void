@@ -6,6 +6,7 @@
 
 use crate::{
     advice::Status,
+    i18n::s,
     usage::{self, Record, median},
 };
 use serde::{Deserialize, Serialize};
@@ -173,22 +174,39 @@ pub fn predict(
 /// "схожі: ще ≈ 6 хв · ≈ 4% квоти" for a turn that has run `elapsed` minutes so far.
 pub fn describe(prediction: &Prediction, elapsed: f64) -> String {
     let left = prediction.minutes - elapsed;
-    let time = if left >= 1.0 {
-        format!("ще ≈ {}", crate::duration(left))
+    let basis = if prediction.similar {
+        s("схожі: ", "похожие: ", "similar: ")
     } else {
-        "довше, ніж зазвичай".to_owned()
+        s("зазвичай: ", "обычно: ", "usually: ")
+    };
+    let time = if left >= 1.0 {
+        let rest = crate::duration(left);
+        t!(
+            "{basis}ще ≈ {rest}",
+            "{basis}ещё ≈ {rest}",
+            "{basis}≈ {rest} more"
+        )
+    } else {
+        // Past the typical length: say so once, with what typical was.
+        let typical = crate::duration(prediction.minutes.max(1.0));
+        t!(
+            "довше, ніж зазвичай (≈ {typical})",
+            "дольше обычного (≈ {typical})",
+            "longer than usual (≈ {typical})"
+        )
     };
     let cost = prediction
         .cost
         .filter(|cost| *cost >= 0.5)
-        .map(|cost| format!(" · ≈ {cost:.0}% квоти"))
+        .map(|cost| {
+            t!(
+                " · ≈ {cost:.0}% квоти",
+                " · ≈ {cost:.0}% квоты",
+                " · ≈ {cost:.0}% of quota"
+            )
+        })
         .unwrap_or_default();
-    let basis = if prediction.similar {
-        "схожі: "
-    } else {
-        "зазвичай: "
-    };
-    format!("{basis}{time}{cost}")
+    format!("{time}{cost}")
 }
 
 /// How many typical turns the agent's five-hour quota still holds.
@@ -216,19 +234,32 @@ pub fn hint(agent: usize, left: [Option<f64>; 2], statuses: [&Status; 2]) -> Opt
     let free = |status: &Status| {
         status.blocked.is_none() && status.risk.is_none() && status.used.is_some()
     };
-    let here = left[agent].map(|n| format!("≈ {n:.0} таких ходів до ліміту 5 год"));
+    let here = left[agent].map(|n| {
+        t!(
+            "≈ {n:.0} таких ходів до ліміту 5 год",
+            "≈ {n:.0} таких ходов до лимита 5 ч",
+            "≈ {n:.0} such turns before the 5 h limit"
+        )
+    });
     if !free(statuses[other]) {
         return here;
     }
     let there = left[other]
-        .map(|n| format!(" ≈ {n:.0} ходів"))
+        .map(|n| t!(" ≈ {n:.0} ходів", " ≈ {n:.0} ходов", " ≈ {n:.0} turns"))
         .unwrap_or_default();
     if statuses[agent].blocked.is_some() || statuses[agent].risk.is_some() {
-        return Some(format!("Наступне — в {}: там запас{there}", NAMES[other]));
+        return Some(t!(
+            "Наступне — в {}: там запас{there}",
+            "Следующее — в {}: там запас{there}",
+            "Next one in {}: it has room{there}",
+            NAMES[other]
+        ));
     }
     match (left[agent], left[other]) {
-        (Some(a), Some(b)) if a < 10.0 && b >= 2.0 * a => Some(format!(
+        (Some(a), Some(b)) if a < 10.0 && b >= 2.0 * a => Some(t!(
             "Велике — краще в {}: ≈ {b:.0} ходів проти {a:.0}",
+            "Большое — лучше в {}: ≈ {b:.0} ходов против {a:.0}",
+            "Big task — better in {}: ≈ {b:.0} turns vs {a:.0}",
             NAMES[other]
         )),
         _ => here,
@@ -294,7 +325,7 @@ mod tests {
         assert_eq!(usual.minutes, 3.0);
         assert!(predict(&turns[..2], 0, "site", None, &[]).is_none());
         assert_eq!(describe(&similar, 10.0), "схожі: ще ≈ 21 хв");
-        assert_eq!(describe(&usual, 5.0), "зазвичай: довше, ніж зазвичай");
+        assert_eq!(describe(&usual, 5.0), "довше, ніж зазвичай (≈ 3 хв)");
     }
 
     #[test]

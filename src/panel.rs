@@ -2,6 +2,7 @@
 
 use crate::{
     advice::{self, Status},
+    i18n::s,
     usage::{self, Record},
 };
 use eframe::egui::{
@@ -20,7 +21,6 @@ const GRAY: Color32 = Color32::from_gray(145);
 pub const MARGIN: f32 = 14.0;
 const PAD: f32 = 18.0;
 const WIDTH: f32 = 320.0;
-const CARD: f32 = 198.0;
 const RADIUS: f32 = 22.0;
 
 /// The system UI font (Segoe UI on Windows, SF on macOS), with egui's own fonts as fallback.
@@ -89,82 +89,15 @@ fn regular(size: f32) -> FontId {
     FontId::proportional(size)
 }
 
-/// Presentation data belongs to one provider, including both of its quota windows.
-pub struct Agent {
-    pub name: &'static str,
-    pub state: &'static str,
-    pub value: String,
-    pub caption: String,
-    pub windows: Vec<Quota>,
-    pub source: String,
-}
 pub struct Quota {
     pub name: &'static str,
     pub remaining: Option<f32>,
     pub value: String,
     pub reset: String,
 }
-pub fn agent(
-    name: &'static str,
-    status: &Status,
-    records: &[Record],
-    estimated: bool,
-    unavailable: Option<&str>,
-    now: u64,
-    offset: i64,
-) -> Agent {
-    let (state, mut value, mut caption) = if let Some((window, reset)) = status.blocked {
-        (
-            "ПАУЗА",
-            advice::countdown(reset, now),
-            format!("до відновлення · ліміт {window}"),
-        )
-    } else if let Some(risk) = &status.risk {
-        (
-            "ПРОГНОЗ",
-            format!("≈ {}", crate::duration(risk.minutes)),
-            risk.prompts
-                .map(|n| format!("≈ {n:.0} запитів до ліміту {}", risk.window))
-                .unwrap_or_else(|| format!("роботи до ліміту {}", risk.window)),
-        )
-    } else if let Some((_, minutes, prompts, _)) = status.lasting {
-        (
-            "ПРОГНОЗ",
-            format!("≈ {}", crate::duration(minutes)),
-            prompts
-                .map(|n| format!("≈ {n:.0} запитів · вистачить до оновлення"))
-                .unwrap_or_else(|| "Вистачить до оновлення квоти".into()),
-        )
-    } else if status.used.is_some_and(|used| used >= 100.0) {
-        (
-            "ПАУЗА",
-            "Ліміт вичерпано".into(),
-            "Час відновлення ще невідомий".into(),
-        )
-    } else if status.used.is_some() {
-        (
-            "ДОСТУПНО",
-            "Можна працювати".into(),
-            "Прогноз з’явиться з історією роботи".into(),
-        )
-    } else if records
-        .last()
-        .is_some_and(|r| r.sample.session_id == "claude-desktop")
-    {
-        (
-            "ОСТАННІ ДАНІ",
-            "Знімок застарів".into(),
-            "Чекаю нове вимірювання Claude Desktop".into(),
-        )
-    } else {
-        let speech = advice::speech([(name, status), (name, status)], now, offset);
-        (
-            "НЕМАЄ ДАНИХ",
-            "Очікую квоти".into(),
-            unavailable.unwrap_or(&speech.detail).to_owned(),
-        )
-    };
-    let windows: Vec<Quota> = advice::WINDOWS
+/// Both quota windows of one provider, as the panel and the agent card show them.
+pub fn quotas(records: &[Record], estimated: bool, now: u64, offset: i64) -> Vec<Quota> {
+    advice::windows()
         .iter()
         .map(|(name, select)| {
             let latest = usage::last_window(records, *select);
@@ -179,9 +112,17 @@ pub fn agent(
                     Quota {
                         name,
                         remaining: Some(left as f32 / 100.0),
-                        value: format!("{}{left:.0}% лишилось", if estimated { "≈ " } else { "" }),
+                        value: format!(
+                            "{}{}",
+                            if estimated { "≈ " } else { "" },
+                            t!(
+                                "{left:.0}% лишилось",
+                                "{left:.0}% осталось",
+                                "{left:.0}% left"
+                            )
+                        ),
                         reset: if limit.resets_at == 0 {
-                            "Час невідомий".into()
+                            s("Час невідомий", "Время неизвестно", "Time unknown").into()
                         } else {
                             format!("↻ {}", advice::clock(limit.resets_at, now, offset))
                         },
@@ -191,106 +132,156 @@ pub fn agent(
                     name,
                     remaining: None,
                     value: latest
-                        .map(|(limit, _)| format!("{:.0}% лишалось", 100.0 - limit.used_percentage))
-                        .unwrap_or_else(|| "Невідомо".into()),
+                        .map(|(limit, _)| {
+                            let left = 100.0 - limit.used_percentage;
+                            t!(
+                                "{left:.0}% лишалось",
+                                "{left:.0}% оставалось",
+                                "{left:.0}% was left"
+                            )
+                        })
+                        .unwrap_or_else(|| s("Невідомо", "Неизвестно", "Unknown").into()),
                     reset: if latest.is_some() {
-                        "Очікую оновлення"
+                        s(
+                            "Очікую оновлення",
+                            "Жду обновления",
+                            "Waiting for an update",
+                        )
                     } else {
-                        "Ще немає вимірювань"
+                        s(
+                            "Ще немає вимірювань",
+                            "Ещё нет измерений",
+                            "No measurements yet",
+                        )
                     }
                     .into(),
                 },
             }
         })
-        .collect();
-    // Lead with what is left of the tighter limit; the forecast and the reset explain it.
-    if status.blocked.is_none()
-        && let Some(binding) = windows
-            .iter()
-            .filter(|quota| quota.remaining.is_some_and(|left| left > 0.0))
-            .min_by(|a, b| {
-                a.remaining
-                    .partial_cmp(&b.remaining)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    {
-        let prompts = |count: Option<f64>| {
-            count
-                .map(|n| format!(" · ≈ {n:.0} запитів"))
-                .unwrap_or_default()
-        };
-        let outlook = match (&status.risk, status.lasting) {
-            (Some(risk), _) => format!(
-                "вистачить на ≈ {}{}",
-                crate::duration(risk.minutes),
-                prompts(risk.prompts)
-            ),
-            (None, Some((_, _, count, _))) => format!("вистачить до оновлення{}", prompts(count)),
-            _ => "прогноз з’явиться з історією роботи".to_owned(),
-        };
-        let reset = binding.reset.strip_prefix("↻ ").map_or_else(
-            || "час оновлення невідомий".to_owned(),
-            |at| format!("оновлення {at}"),
-        );
-        value = binding.value.clone();
-        caption = format!("ліміт {} · {reset}\n{outlook}", binding.name);
-    }
-    let seen = records
-        .iter()
-        .filter(|r| r.sample.rate_limits.is_some())
-        .map(|r| r.time)
-        .max();
-    let age = seen.map(|at| now.saturating_sub(at));
-    let freshness = match age {
-        Some(0..=59) => "щойно".into(),
-        Some(60..=3599) => format!("{} хв тому", age.unwrap() / 60),
-        Some(seconds) => format!("{} год тому", seconds / 3600),
-        None => "очікування".into(),
+        .collect()
+}
+
+/// One agent's line in the menu: what is left, until when, and what was spent.
+pub struct Row {
+    pub agent: usize,
+    /// "84%" of the tighter limit, or "пауза".
+    pub big: String,
+    pub paused: bool,
+    /// "лишилось · 5 год ↻ о 23:50" or "повернеться о 19:28".
+    pub under: String,
+    /// "Витрачено 1,2 млн за 5 год · 9,8 млн за тиждень".
+    pub spent: Option<String>,
+}
+
+/// "1,2 млн", "640 тис." or "950" — a count that fits a short line.
+pub fn short_tokens(tokens: u64) -> String {
+    let comma = |text: String| match crate::i18n::lang() {
+        crate::i18n::Lang::En => text,
+        _ => text.replace('.', ","),
     };
-    let source = format!(
-        "{} · {freshness}",
-        if records
-            .last()
-            .is_some_and(|row| row.sample.session_id == "claude-desktop")
-        {
-            "Історія Claude Desktop"
-        } else if records
-            .last()
-            .is_some_and(|row| row.sample.session_id == "claude-block")
-        {
-            "Блокування Claude"
-        } else if estimated {
-            "Локальна оцінка"
-        } else if age.is_some_and(|age| age > 1800) {
-            "Останні дані"
-        } else {
-            "Дані квот"
-        }
-    );
-    Agent {
-        name,
-        state,
-        value,
-        caption,
-        windows,
-        source,
+    if tokens >= 1_000_000 {
+        let m = comma(format!("{:.1}", tokens as f64 / 1e6));
+        t!("{m} млн", "{m} млн", "{m}M")
+    } else if tokens >= 1000 {
+        let k = tokens / 1000;
+        t!("{k} тис.", "{k} тыс.", "{k}k")
+    } else {
+        tokens.to_string()
     }
 }
-pub struct Bubble {
-    agents: [Agent; 2],
+
+/// What the menu says about one agent.
+#[allow(clippy::too_many_arguments)]
+pub fn row(
+    agent: usize,
+    status: &Status,
+    records: &[Record],
+    unavailable: Option<&str>,
+    spent: [Option<u64>; 2],
+    now: u64,
+    offset: i64,
+) -> Row {
+    let windows = quotas(records, false, now, offset);
+    let tighter = windows
+        .iter()
+        .filter(|quota| quota.remaining.is_some())
+        .min_by(|a, b| {
+            a.remaining
+                .partial_cmp(&b.remaining)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    let (big, paused, under) = if let Some((_, reset)) = status.blocked {
+        let back = advice::clock(reset, now, offset);
+        (
+            s("пауза", "пауза", "paused").to_owned(),
+            true,
+            t!("повернеться {back}", "вернётся {back}", "back {back}"),
+        )
+    } else if let Some(quota) = tighter {
+        let left = quota.remaining.unwrap_or(0.0) * 100.0;
+        let (window, reset) = (quota.name, &quota.reset);
+        (
+            format!("{left:.0}%"),
+            false,
+            t!(
+                "лишилось · {window} {reset}",
+                "осталось · {window} {reset}",
+                "left · {window} {reset}"
+            ),
+        )
+    } else {
+        (
+            "—".to_owned(),
+            false,
+            unavailable
+                .unwrap_or(s("немає даних", "нет данных", "no data"))
+                .to_owned(),
+        )
+    };
+    let spent = match spent {
+        [Some(five), Some(week)] if week > 0 => {
+            let (five, week) = (short_tokens(five), short_tokens(week));
+            Some(t!(
+                "Витрачено {five} за 5 год · {week} за тиждень",
+                "Потрачено {five} за 5 ч · {week} за неделю",
+                "Spent {five} in 5 h · {week} this week"
+            ))
+        }
+        _ => None,
+    };
+    Row {
+        agent,
+        big,
+        paused,
+        under,
+        spent,
+    }
+}
+
+const HEADER: f32 = 62.0;
+const ROW_HEIGHT: f32 = 72.0;
+
+/// The menu: one verdict, one line per agent, and settings behind the gear.
+pub struct Menu {
+    pub title: String,
+    pub detail: String,
+    pub rows: [Row; 2],
     pub size: Vec2,
 }
-pub fn layout(agents: [Agent; 2]) -> Bubble {
-    let height = PAD * 2.0 + CARD + 40.0;
-    Bubble {
-        agents,
-        size: Vec2::new(WIDTH, height),
+
+pub fn menu(title: String, detail: String, rows: [Row; 2]) -> Menu {
+    Menu {
+        title,
+        detail,
+        rows,
+        size: Vec2::new(WIDTH, PAD + HEADER + 2.0 * ROW_HEIGHT + PAD - 8.0),
     }
 }
-pub fn window_size(bubble: &Bubble) -> Vec2 {
+
+pub fn window_size(menu: &Menu) -> Vec2 {
     Vec2::new(
-        bubble.size.x + MARGIN * 2.0,
-        88.0 + bubble.size.y + MARGIN + 6.0,
+        menu.size.x + MARGIN * 2.0,
+        88.0 + menu.size.y + MARGIN + 6.0,
     )
 }
 
@@ -328,16 +319,24 @@ fn gradient(painter: &egui::Painter, rect: Rect, radius: f32, top: Color32, bott
     }
 }
 
-/// Draws the bubble with its bottom edge just above the cat and the tail pointing at it.
+/// A choice made in the settings view, for the app to apply and save.
+pub enum Action {
+    Language(crate::i18n::Lang),
+    Sound(bool),
+    Preview,
+}
+
+/// Draws the menu with its bottom edge just above the cat. Returns the menu's rectangle and
+/// any settings choice.
 pub fn draw(
     ui: &egui::Ui,
-    bubble: &Bubble,
+    menu: &Menu,
     bottom_right: Pos2,
-    _anchor: f32,
-    selected: &mut usize,
-) {
+    settings_open: &mut bool,
+    settings: &crate::settings::Settings,
+) -> (Rect, Option<Action>) {
     let painter = ui.painter();
-    let rect = Rect::from_min_max(bottom_right - bubble.size, bottom_right);
+    let rect = Rect::from_min_max(bottom_right - menu.size, bottom_right);
     painter.add(
         Shadow {
             offset: [0, 10],
@@ -354,141 +353,222 @@ pub fn draw(
         Stroke::new(1.0, Color32::from_white_alpha(28)),
         StrokeKind::Inside,
     );
-    *selected = (*selected).min(1);
-    let tabs = Rect::from_min_size(
-        rect.min + Vec2::new(PAD, 14.0),
-        Vec2::new(WIDTH - PAD * 2.0, 32.0),
+    let (left, right) = (rect.left() + PAD + 4.0, rect.right() - PAD - 4.0);
+    let top = rect.top() + PAD;
+
+    // Header: the verdict, or the settings title, and the gear.
+    let gear = Rect::from_min_size(Pos2::new(right - 30.0, top - 4.0), Vec2::splat(30.0));
+    let response = ui
+        .interact(gear, ui.id().with("settings"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            true,
+            *settings_open,
+            s("Налаштування", "Настройки", "Settings"),
+        )
+    });
+    if response.clicked() {
+        *settings_open = !*settings_open;
+    }
+    if *settings_open || response.hovered() {
+        painter.rect_filled(
+            gear,
+            9.0,
+            Color32::from_white_alpha(if *settings_open { 34 } else { 14 }),
+        );
+    }
+    painter.text(
+        gear.center(),
+        egui::Align2::CENTER_CENTER,
+        if *settings_open { "✕" } else { "⚙" },
+        regular(15.0),
+        if *settings_open || response.hovered() {
+            LABEL
+        } else {
+            SECONDARY
+        },
     );
-    painter.rect_filled(tabs, 10.0, Color32::from_black_alpha(65));
-    for (index, agent) in bubble.agents.iter().enumerate() {
+    let (title, detail) = if *settings_open {
+        (
+            s("Налаштування", "Настройки", "Settings").to_owned(),
+            String::new(),
+        )
+    } else {
+        (menu.title.clone(), menu.detail.clone())
+    };
+    let title = painter.layout(title, strong(15.5), LABEL, right - left - 40.0);
+    painter.galley(Pos2::new(left, top), title, LABEL);
+    let detail = painter.layout(detail, regular(11.5), SECONDARY, right - left - 40.0);
+    painter.galley(Pos2::new(left, top + 24.0), detail, SECONDARY);
+
+    let area = Rect::from_min_max(
+        Pos2::new(left, top + HEADER - 8.0),
+        Pos2::new(right, rect.bottom() - PAD),
+    );
+    let action = if *settings_open {
+        settings_body(ui, area, settings)
+    } else {
+        for (i, row) in menu.rows.iter().enumerate() {
+            let y = area.top() + i as f32 * ROW_HEIGHT;
+            painter.line_segment(
+                [Pos2::new(left, y), Pos2::new(right, y)],
+                Stroke::new(1.0, Color32::from_white_alpha(18)),
+            );
+            let color = tint(row.agent);
+            painter.circle_filled(Pos2::new(left + 4.0, y + 21.0), 4.0, color);
+            painter.text(
+                Pos2::new(left + 16.0, y + 12.0),
+                egui::Align2::LEFT_TOP,
+                ["Claude", "Codex"][row.agent],
+                strong(13.5),
+                LABEL,
+            );
+            painter.text(
+                Pos2::new(right, y + 8.0),
+                egui::Align2::RIGHT_TOP,
+                &row.big,
+                strong(if row.paused { 17.0 } else { 24.0 }),
+                if row.paused { SECONDARY } else { LABEL },
+            );
+            painter.text(
+                Pos2::new(left + 16.0, y + 31.0),
+                egui::Align2::LEFT_TOP,
+                &row.under,
+                regular(11.0),
+                SECONDARY,
+            );
+            if let Some(spent) = &row.spent {
+                painter.text(
+                    Pos2::new(left + 16.0, y + 48.0),
+                    egui::Align2::LEFT_TOP,
+                    spent,
+                    regular(11.0),
+                    color.gamma_multiply(0.9),
+                );
+            }
+        }
+        None
+    };
+    (rect, action)
+}
+
+/// Language and sound, in the space the agent lines use.
+fn settings_body(
+    ui: &egui::Ui,
+    area: Rect,
+    settings: &crate::settings::Settings,
+) -> Option<Action> {
+    let painter = ui.painter();
+    let mut action = None;
+    let (left, right, top) = (area.left(), area.right(), area.top());
+    painter.text(
+        Pos2::new(left, top + 4.0),
+        egui::Align2::LEFT_TOP,
+        s("Мова", "Язык", "Language"),
+        regular(11.0),
+        SECONDARY,
+    );
+    let row = Rect::from_min_max(Pos2::new(left, top + 22.0), Pos2::new(right, top + 52.0));
+    painter.rect_filled(row, 9.0, Color32::from_black_alpha(65));
+    let width = row.width() / 3.0;
+    for (i, lang) in crate::i18n::Lang::ALL.into_iter().enumerate() {
         let cell = Rect::from_min_size(
-            tabs.min + Vec2::new(index as f32 * tabs.width() / 2.0, 0.0),
-            Vec2::new(tabs.width() / 2.0, tabs.height()),
+            row.min + Vec2::new(i as f32 * width, 0.0),
+            Vec2::new(width, row.height()),
         )
         .shrink(3.0);
+        let chosen = settings.language == lang;
         let response = ui
-            .interact(
-                cell,
-                ui.id().with(("provider-tab", index)),
-                egui::Sense::click(),
-            )
+            .interact(cell, ui.id().with(("language", i)), egui::Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         response.widget_info(|| {
-            egui::WidgetInfo::selected(
-                egui::WidgetType::SelectableLabel,
-                true,
-                *selected == index,
-                agent.name,
-            )
+            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, chosen, lang.label())
         });
-        if response.clicked() {
-            *selected = index;
+        if response.clicked() && !chosen {
+            action = Some(Action::Language(lang));
         }
-        if *selected == index {
+        if chosen {
             gradient(
                 painter,
                 cell,
-                8.0,
+                7.0,
                 Color32::from_white_alpha(38),
                 Color32::from_white_alpha(18),
             );
-            painter.rect_stroke(
-                cell,
-                8.0,
-                Stroke::new(0.5, Color32::from_white_alpha(30)),
-                StrokeKind::Inside,
-            );
         } else if response.hovered() {
-            painter.rect_filled(cell, 8.0, Color32::from_white_alpha(8));
-        }
-        if response.has_focus() {
-            painter.rect_stroke(cell, 8.0, Stroke::new(1.0, LABEL), StrokeKind::Inside);
+            painter.rect_filled(cell, 7.0, Color32::from_white_alpha(8));
         }
         painter.text(
             cell.center(),
             egui::Align2::CENTER_CENTER,
-            agent.name,
-            strong(12.5),
-            if *selected == index { LABEL } else { SECONDARY },
+            lang.label(),
+            strong(12.0),
+            if chosen { LABEL } else { SECONDARY },
         );
     }
-    {
-        let agent = &bubble.agents[*selected];
-        let top = rect.top() + PAD + 40.0;
-        let card = Rect::from_min_size(
-            Pos2::new(rect.left() + 10.0, top - 6.0),
-            Vec2::new(WIDTH - 20.0, CARD + 2.0),
-        );
-        gradient(
-            painter,
-            card,
-            16.0,
-            Color32::from_white_alpha(10),
-            Color32::from_white_alpha(2),
-        );
-        painter.rect_stroke(
-            card,
-            16.0,
-            Stroke::new(0.5, Color32::from_white_alpha(19)),
-            StrokeKind::Inside,
-        );
-        let left = rect.left() + PAD + 8.0;
-        let right = rect.right() - PAD - 8.0;
-        let text = |position, content: &str, font, color| {
-            painter.text(position, egui::Align2::LEFT_TOP, content, font, color);
-        };
-        text(Pos2::new(left, top + 4.0), agent.name, strong(15.0), LABEL);
-        painter.text(
-            Pos2::new(right, top + 7.0),
-            egui::Align2::RIGHT_TOP,
-            agent.state,
-            regular(10.0),
-            SECONDARY,
-        );
-        text(
-            Pos2::new(left, top + 31.0),
-            &agent.value,
-            strong(24.0),
-            LABEL,
-        );
-        // Wrapped supporting copy has its own bounded region, never overlays the quotas.
-        let caption = painter.layout(
-            agent.caption.clone(),
-            regular(11.5),
-            SECONDARY,
-            right - left,
-        );
-        painter.galley(Pos2::new(left, top + 64.0), caption, SECONDARY);
-        let cell_width = (right - left - 20.0) / 2.0;
-        for (i, quota) in agent.windows.iter().enumerate() {
-            let x = left + i as f32 * (cell_width + 20.0);
-            text(
-                Pos2::new(x, top + 100.0),
-                quota.name,
-                regular(11.0),
-                SECONDARY,
-            );
-            text(Pos2::new(x, top + 117.0), &quota.value, strong(12.0), LABEL);
-            let track = Rect::from_min_size(Pos2::new(x, top + 138.0), Vec2::new(cell_width, 3.0));
-            painter.rect_filled(track, 2.0, Color32::from_white_alpha(25));
-            if let Some(share) = quota.remaining.filter(|share| *share > 0.0) {
-                let fill = Rect::from_min_size(track.min, Vec2::new(track.width() * share, 3.0));
-                painter.rect_filled(fill, 2.0, LABEL);
-            }
-            text(
-                Pos2::new(x, top + 148.0),
-                &quota.reset,
-                regular(10.0),
-                SECONDARY,
-            );
-        }
-        text(
-            Pos2::new(left, top + 178.0),
-            &agent.source,
-            regular(10.0),
-            SECONDARY,
-        );
+    painter.text(
+        Pos2::new(left, top + 70.0),
+        egui::Align2::LEFT_TOP,
+        s(
+            "Звук, коли агент закінчив",
+            "Звук, когда агент закончил",
+            "Sound when an agent finishes",
+        ),
+        regular(12.0),
+        LABEL,
+    );
+    let switch = Rect::from_min_size(Pos2::new(right - 40.0, top + 67.0), Vec2::new(40.0, 22.0));
+    let response = ui
+        .interact(switch, ui.id().with("sound"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            true,
+            settings.sound,
+            s("Звук", "Звук", "Sound"),
+        )
+    });
+    if response.clicked() {
+        action = Some(Action::Sound(!settings.sound));
     }
+    let on = ui
+        .ctx()
+        .animate_bool_with_time(response.id, settings.sound, 0.15);
+    painter.rect_filled(
+        switch,
+        11.0,
+        mix(Color32::from_white_alpha(30), tint(0), on),
+    );
+    painter.circle_filled(
+        Pos2::new(switch.left() + 11.0 + on * 18.0, switch.center().y),
+        8.0,
+        LABEL,
+    );
+    let preview = Rect::from_min_size(Pos2::new(left, top + 96.0), Vec2::new(160.0, 20.0));
+    let response = ui
+        .interact(preview, ui.id().with("preview"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked() {
+        action = Some(Action::Preview);
+    }
+    painter.text(
+        preview.left_center(),
+        egui::Align2::LEFT_CENTER,
+        s("▶ Прослухати", "▶ Прослушать", "▶ Play it"),
+        regular(11.0),
+        if response.hovered() { LABEL } else { SECONDARY },
+    );
+    painter.text(
+        Pos2::new(right, area.bottom() - 2.0),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("Void {}", env!("CARGO_PKG_VERSION")),
+        regular(10.0),
+        GRAY,
+    );
+    action
 }
 
 /// Height above the cat taken by the thought bubble while an agent works.
@@ -666,17 +746,23 @@ pub fn thought_bubble(
 }
 
 fn sessions_word(count: usize) -> &'static str {
+    let (one, few, many) = match crate::i18n::lang() {
+        crate::i18n::Lang::Uk => ("сесія", "сесії", "сесій"),
+        crate::i18n::Lang::Ru => ("сессия", "сессии", "сессий"),
+        crate::i18n::Lang::En => ("session", "sessions", "sessions"),
+    };
     match (count % 10, count % 100) {
-        (1, n) if n != 11 => "сесія",
-        (2..=4, n) if !(12..=14).contains(&n) => "сесії",
-        _ => "сесій",
+        _ if crate::i18n::lang() == crate::i18n::Lang::En && count != 1 => few,
+        (1, n) if n != 11 => one,
+        (2..=4, n) if !(12..=14).contains(&n) => few,
+        _ => many,
     }
 }
 
 fn elapsed(since: u64, now: u64) -> String {
     let minutes = now.saturating_sub(since) / 60;
     if minutes == 0 {
-        "щойно".into()
+        s("щойно", "только что", "just now").into()
     } else {
         crate::duration(minutes as f64)
     }
@@ -687,13 +773,70 @@ fn tool_name(tool: &str) -> &str {
     tool.rsplit("__").next().unwrap_or(tool)
 }
 
-const ROW: f32 = 56.0;
+/// Roughly how many characters of the prompt fit one line of the card.
+const PROMPT_LINE: usize = 40;
+const LINE: f32 = 15.0;
 
-pub fn busy_card_size(sessions: usize, hint: bool) -> Vec2 {
-    let rows = sessions.min(BUSY_ROWS) as f32;
-    let more = if sessions > BUSY_ROWS { 18.0 } else { 0.0 };
-    let footer = if hint { 54.0 } else { 34.0 };
-    Vec2::new(BUSY_WIDTH, 44.0 + rows * ROW + more + footer)
+/// The prompt on one line of text, cut to two card lines; and how many lines it takes.
+fn prompt_preview(prompt: &str) -> (String, usize) {
+    let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let limit = PROMPT_LINE * 2 - 3;
+    let text = if flat.chars().count() > limit {
+        format!(
+            "«{}…»",
+            flat.chars().take(limit - 1).collect::<String>().trim_end()
+        )
+    } else {
+        format!("«{flat}»")
+    };
+    let lines = text.chars().count().div_ceil(PROMPT_LINE).clamp(1, 2);
+    (text, lines)
+}
+
+fn row_height(session: &crate::activity::Session, prediction: bool) -> f32 {
+    let prompt = session
+        .prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty())
+        .map_or(0, |prompt| prompt_preview(prompt).1);
+    18.0 + prompt as f32 * LINE + 16.0 + if prediction { LINE } else { 0.0 } + 12.0
+}
+
+/// "18,4 тис. токенів", "18,4 тыс. токенов" or "18.4k tokens".
+pub fn tokens_text(tokens: u64) -> String {
+    let comma = |text: String| match crate::i18n::lang() {
+        crate::i18n::Lang::En => text,
+        _ => text.replace('.', ","),
+    };
+    if tokens >= 1_000_000 {
+        let m = comma(format!("{:.2}", tokens as f64 / 1e6));
+        t!("{m} млн токенів", "{m} млн токенов", "{m}M tokens")
+    } else if tokens >= 1000 {
+        let k = comma(format!("{:.1}", tokens as f64 / 1e3));
+        t!("{k} тис. токенів", "{k} тыс. токенов", "{k}k tokens")
+    } else {
+        t!("{tokens} токенів", "{tokens} токенов", "{tokens} tokens")
+    }
+}
+
+pub fn busy_card_size(
+    sessions: &[crate::activity::Session],
+    predictions: &[Option<String>],
+    hint: bool,
+) -> Vec2 {
+    let rows: f32 = sessions
+        .iter()
+        .take(BUSY_ROWS)
+        .enumerate()
+        .map(|(i, session)| row_height(session, predictions.get(i).is_some_and(Option::is_some)))
+        .sum();
+    let more = if sessions.len() > BUSY_ROWS {
+        18.0
+    } else {
+        0.0
+    };
+    let footer = if hint { 90.0 } else { 70.0 };
+    Vec2::new(BUSY_WIDTH, 44.0 + rows + more + footer)
 }
 
 /// What the hovered agent is doing: one row per busy session and the quota in one line.
@@ -704,7 +847,7 @@ pub fn busy_card(
     agent: usize,
     sessions: &[crate::activity::Session],
     predictions: &[Option<String>],
-    quota: &str,
+    quotas: &[Quota],
     hint: Option<&str>,
     now: u64,
     time: Option<f64>,
@@ -745,7 +888,7 @@ pub fn busy_card(
     painter.text(
         Pos2::new(left + 14.0, y),
         egui::Align2::LEFT_TOP,
-        format!("{name} працює"),
+        t!("{name} працює", "{name} работает", "{name} is working"),
         strong(13.5),
         LABEL,
     );
@@ -759,10 +902,12 @@ pub fn busy_card(
     y += 30.0;
     for (i, session) in sessions.iter().take(BUSY_ROWS).enumerate() {
         let project = if session.project.is_empty() {
-            "Без назви"
+            s("Без назви", "Без названия", "Untitled")
         } else {
             &session.project
         };
+        let prediction = predictions.get(i).cloned().flatten();
+        let height = row_height(session, prediction.is_some());
         let time = painter.layout_no_wrap(elapsed(session.since, now), regular(11.0), SECONDARY);
         let room = right - left - time.size().x - 10.0;
         let title = painter.layout(project.to_owned(), strong(12.0), LABEL, room);
@@ -775,36 +920,61 @@ pub fn busy_card(
             ))
             .galley(Pos2::new(left, y), title, LABEL);
         painter.galley(Pos2::new(right - time.size().x, y + 1.0), time, SECONDARY);
+        let mut line = y + 18.0;
+        // What was asked, in the user's own words: the reason this turn exists.
+        if let Some(prompt) = session.prompt.as_deref().filter(|p| !p.trim().is_empty()) {
+            let (text, lines) = prompt_preview(prompt);
+            let galley = painter.layout(text, regular(11.0), Color32::from_gray(222), right - left);
+            painter
+                .with_clip_rect(Rect::from_min_size(
+                    Pos2::new(left, line),
+                    Vec2::new(right - left, lines as f32 * LINE),
+                ))
+                .galley(Pos2::new(left, line), galley, Color32::from_gray(222));
+            line += lines as f32 * LINE;
+        }
         let doing = session.tool.as_deref().map_or_else(
-            || "думає".to_owned(),
-            |tool| format!("виконує {}", tool_name(tool)),
+            || s("думає", "думает", "thinking").to_owned(),
+            |tool| {
+                let tool = tool_name(tool);
+                t!("виконує {tool}", "выполняет {tool}", "running {tool}")
+            },
         );
+        let status = if session.tokens > 0 {
+            format!("{doing} · {}", tokens_text(session.tokens))
+        } else {
+            doing
+        };
         painter.text(
-            Pos2::new(left, y + 18.0),
+            Pos2::new(left, line + 1.0),
             egui::Align2::LEFT_TOP,
-            doing,
+            status,
             regular(10.5),
             SECONDARY,
         );
-        // The forecast for this turn, in the agent's color; quiet until there is history.
-        let (forecast, tone) = match predictions.get(i).cloned().flatten() {
-            Some(text) => (text, color.gamma_multiply(0.85)),
-            None => ("прогноз з'явиться після кількох ходів".to_owned(), GRAY),
-        };
-        painter.text(
-            Pos2::new(left, y + 33.0),
-            egui::Align2::LEFT_TOP,
-            forecast,
-            regular(10.5),
-            tone,
-        );
-        y += ROW;
+        line += 16.0;
+        // A forecast only once there is history to build it from.
+        if let Some(forecast) = prediction {
+            painter.text(
+                Pos2::new(left, line),
+                egui::Align2::LEFT_TOP,
+                forecast,
+                regular(10.5),
+                color.gamma_multiply(0.85),
+            );
+        }
+        y += height;
     }
     if sessions.len() > BUSY_ROWS {
         painter.text(
             Pos2::new(left, y - 2.0),
             egui::Align2::LEFT_TOP,
-            format!("і ще {}", sessions.len() - BUSY_ROWS),
+            t!(
+                "і ще {}",
+                "и ещё {}",
+                "and {} more",
+                sessions.len() - BUSY_ROWS
+            ),
             regular(10.5),
             GRAY,
         );
@@ -814,16 +984,42 @@ pub fn busy_card(
         [Pos2::new(left, y + 2.0), Pos2::new(right, y + 2.0)],
         Stroke::new(1.0, Color32::from_white_alpha(20)),
     );
-    painter.text(
-        Pos2::new(left, y + 11.0),
-        egui::Align2::LEFT_TOP,
-        quota,
-        regular(10.5),
-        SECONDARY,
-    );
+    // Both limits side by side, like the panel: what is left, a bar, and when it resets.
+    let gap = 12.0;
+    let column = (right - left - gap) / 2.0;
+    for (i, quota) in quotas.iter().take(2).enumerate() {
+        let x = left + i as f32 * (column + gap);
+        painter.text(
+            Pos2::new(x, y + 10.0),
+            egui::Align2::LEFT_TOP,
+            quota.name,
+            regular(10.0),
+            SECONDARY,
+        );
+        painter.text(
+            Pos2::new(x, y + 23.0),
+            egui::Align2::LEFT_TOP,
+            &quota.value,
+            strong(11.5),
+            LABEL,
+        );
+        let track = Rect::from_min_size(Pos2::new(x, y + 41.0), Vec2::new(column, 3.0));
+        painter.rect_filled(track, 2.0, Color32::from_white_alpha(25));
+        if let Some(share) = quota.remaining.filter(|share| *share > 0.0) {
+            let fill = Rect::from_min_size(track.min, Vec2::new(track.width() * share, 3.0));
+            painter.rect_filled(fill, 2.0, color);
+        }
+        painter.text(
+            Pos2::new(x, y + 48.0),
+            egui::Align2::LEFT_TOP,
+            &quota.reset,
+            regular(9.5),
+            SECONDARY,
+        );
+    }
     if let Some(hint) = hint {
         painter.text(
-            Pos2::new(left, y + 29.0),
+            Pos2::new(left, y + 66.0),
             egui::Align2::LEFT_TOP,
             format!("→ {hint}"),
             strong(11.0),
@@ -846,66 +1042,94 @@ mod tests {
         assert_eq!(elapsed(1000, 1030), "щойно");
         assert_eq!(elapsed(0, 65 * 60), "1 год 05 хв");
         assert_eq!(tool_name("mcp__github__create_issue"), "create_issue");
+        let session = |prompt: Option<&str>| crate::activity::Session {
+            id: Default::default(),
+            project: "p".into(),
+            since: 0,
+            tool: None,
+            busy: true,
+            end: 0,
+            prompt: prompt.map(Into::into),
+            tokens: 0,
+        };
+        let five: Vec<_> = (0..5).map(|_| session(None)).collect();
         assert_eq!(
-            busy_card_size(5, false).y,
-            busy_card_size(3, false).y + 18.0
+            busy_card_size(&five, &[], false).y,
+            busy_card_size(&five[..3], &[], false).y + 18.0
         );
-        assert_eq!(busy_card_size(1, true).y, busy_card_size(1, false).y + 20.0);
+        let one = [session(None)];
+        assert_eq!(
+            busy_card_size(&one, &[], true).y,
+            busy_card_size(&one, &[], false).y + 20.0
+        );
+        // A long prompt takes two lines, a forecast one more.
+        let asked = [session(Some(&"word ".repeat(60)))];
+        assert_eq!(
+            busy_card_size(&asked, &[Some("x".into())], false).y,
+            busy_card_size(&one, &[], false).y + 3.0 * LINE
+        );
+        let (text, lines) = prompt_preview("fix\n  the   login");
+        assert_eq!((text.as_str(), lines), ("«fix the login»", 1));
+        assert_eq!(tokens_text(18_400), "18,4 тис. токенів");
+        assert_eq!(tokens_text(950), "950 токенів");
+        let now = 1_800_000_000;
+        let windows = quotas(&crate::demo_codex_history(now), false, now, 0);
+        assert_eq!(
+            windows.iter().map(|q| q.name).collect::<Vec<_>>(),
+            ["5 год", "7 днів"]
+        );
     }
     #[test]
-    fn provider_cards_keep_their_own_windows_and_estimate_labels() {
+    fn menu_rows_lead_with_what_is_left_and_what_was_spent() {
         let now = 1_800_000_000;
-        let claude = vec![crate::demo_claude_snapshot(now)];
         let codex = crate::demo_codex_history(now);
-        let a = agent(
-            "Claude",
-            &advice::assess(&claude, now),
-            &claude,
-            true,
-            None,
-            now,
-            0,
-        );
-        let b = agent(
-            "Codex",
+        let row = row(
+            1,
             &advice::assess(&codex, now),
             &codex,
-            false,
             None,
+            [Some(1_250_000), Some(9_800_000)],
             now,
             0,
         );
-        assert_eq!(a.state, "ПАУЗА");
-        assert_eq!(a.windows[0].remaining, None);
-        assert_eq!(a.windows[1].remaining, Some(0.0));
-        assert!(a.source.starts_with("Локальна оцінка"));
-        assert_eq!(b.state, "ПРОГНОЗ");
-        assert_eq!(b.windows[0].value, "24% лишилось");
-        // The headline is what is left of the tighter limit, not a duration.
-        assert_eq!(b.value, "24% лишилось");
+        assert_eq!(row.big, "24%");
         assert!(
-            b.caption.starts_with("ліміт 5 год · оновлення "),
+            row.under.starts_with("лишилось · 5 год ↻ "),
             "{}",
-            b.caption
+            row.under
         );
-        assert!(b.caption.contains("12 запитів"));
-    }
-    #[test]
-    fn missing_or_expired_measurements_never_render_as_free_quota() {
-        let now = 1_800_000_000;
-        let rows = crate::demo_codex_history(now);
-        let expired = now + 86401;
-        let card = agent(
-            "Codex",
-            &advice::assess(&rows, expired),
-            &rows,
-            false,
+        assert_eq!(
+            row.spent.as_deref(),
+            Some("Витрачено 1,2 млн за 5 год · 9,8 млн за тиждень")
+        );
+        let claude = vec![crate::demo_claude_snapshot(now)];
+        let paused = super::row(
+            0,
+            &advice::assess(&claude, now),
+            &claude,
+            None,
+            [None, None],
+            now,
+            0,
+        );
+        assert!(paused.paused);
+        assert!(paused.under.starts_with("повернеться "), "{}", paused.under);
+        assert_eq!(paused.spent, None);
+        let expired = now + 86_401;
+        let unknown = super::row(
+            1,
+            &advice::assess(&codex, expired),
+            &codex,
             Some("Немає зв’язку"),
+            [None, None],
             expired,
             0,
         );
-        assert_eq!(card.state, "НЕМАЄ ДАНИХ");
-        assert!(card.windows.iter().all(|window| window.remaining.is_none()));
-        assert_eq!(card.caption, "Немає зв’язку");
+        assert_eq!(
+            (unknown.big.as_str(), unknown.under.as_str()),
+            ("—", "Немає зв’язку")
+        );
+        assert_eq!(short_tokens(640_400), "640 тис.");
+        assert_eq!(short_tokens(950), "950");
     }
 }

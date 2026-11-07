@@ -51,6 +51,91 @@ struct Window {
     resets_at: Option<u64>,
 }
 
+/// Tokens Codex spent per minute, read incrementally from its session files: each
+/// `token_count` event carries the session's running total, so a call spent the difference.
+#[derive(Default)]
+pub struct TokenLedger {
+    files: std::collections::HashMap<PathBuf, LedgerFile>,
+}
+
+/// Bytes read so far, the session's running total, and (minute, tokens) per call.
+type LedgerFile = (u64, u64, Vec<(u64, u64)>);
+
+impl TokenLedger {
+    pub fn refresh(&mut self, now: u64) -> Vec<(u64, u64)> {
+        use std::io::Read;
+        let Some(home) = codex_home() else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        find_recent(&home.join("sessions"), 3, &mut files);
+        for (_, path) in files {
+            let (offset, total, events) = self.files.entry(path.clone()).or_default();
+            let Ok(mut file) = File::open(&path) else {
+                continue;
+            };
+            let len = file.metadata().map_or(0, |meta| meta.len());
+            if len < *offset {
+                (*offset, *total) = (0, 0);
+                events.clear();
+            }
+            if len == *offset || file.seek(SeekFrom::Start(*offset)).is_err() {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            if file.read_to_end(&mut bytes).is_err() {
+                continue;
+            }
+            // Leave a half-written last line for the next refresh.
+            let Some(end) = bytes.iter().rposition(|&b| b == b'\n') else {
+                continue;
+            };
+            *offset += end as u64 + 1;
+            for line in bytes[..end].split(|&b| b == b'\n') {
+                if !line.windows(11).any(|w| w == b"token_count") {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_slice::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let (Some(time), Some(running)) = (
+                    entry
+                        .get("timestamp")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(epoch),
+                    entry
+                        .pointer("/payload/info/total_token_usage")
+                        .and_then(crate::activity::codex_tokens),
+                ) else {
+                    continue;
+                };
+                if running > *total {
+                    events.push((time - time % 60, running - *total));
+                    *total = running;
+                }
+            }
+        }
+        let since = now.saturating_sub(8 * 86_400);
+        let mut minutes = std::collections::BTreeMap::new();
+        for (time, tokens) in self.files.values().flat_map(|file| file.2.iter()) {
+            if *time >= since {
+                *minutes.entry(*time).or_insert(0) += tokens;
+            }
+        }
+        minutes.into_iter().collect()
+    }
+}
+
+fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(|home| PathBuf::from(home).join(".codex"))
+        })
+}
+
 pub fn history() -> Vec<Record> {
     let home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)

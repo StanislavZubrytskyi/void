@@ -13,6 +13,8 @@ use std::{
 // shortcut: a single tool running silently longer than this drops off; upgrade if builds that long are common.
 const STALE: Duration = Duration::from_secs(15 * 60);
 const TAIL: u64 = 256 * 1024;
+/// How far back to look, once, for the prompt of a turn that began before the usual tail.
+const DEEP_TAIL: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Session {
@@ -29,9 +31,33 @@ pub struct Session {
     pub end: u64,
     /// What the user asked for in this turn, cut to PROMPT_CHARS.
     pub prompt: Option<String>,
+    /// Tokens the turn has spent so far: fresh input, cache writes and output, without cache reads.
+    pub tokens: u64,
 }
 
 const PROMPT_CHARS: usize = 1000;
+
+/// Tokens one Claude response spent: fresh input, cache writes and output. Cache reads repeat the
+/// whole conversation on every call and would dwarf the real work, so they are left out.
+fn claude_tokens(usage: &Value) -> u64 {
+    [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+    ]
+    .iter()
+    .filter_map(|key| usage.get(*key)?.as_u64())
+    .sum()
+}
+
+/// The same measure from a Codex token total: uncached input plus output.
+pub fn codex_tokens(total: &Value) -> Option<u64> {
+    let field = |key: &str| total.get(key).and_then(Value::as_u64).unwrap_or(0);
+    total.get("input_tokens")?;
+    Some(
+        field("input_tokens").saturating_sub(field("cached_input_tokens")) + field("output_tokens"),
+    )
+}
 
 fn prompt_text(text: &str) -> String {
     text.trim().chars().take(PROMPT_CHARS).collect()
@@ -39,7 +65,16 @@ fn prompt_text(text: &str) -> String {
 
 /// The last turn of one transcript: 0 is Claude, 1 is Codex.
 pub fn read_turn(agent: usize, path: &Path) -> Option<Session> {
-    let lines = tail_lines(path)?;
+    read_turn_from(agent, path, TAIL)
+}
+
+/// The same, reading much further back: for a long turn whose prompt left the usual tail.
+pub fn read_turn_deep(agent: usize, path: &Path) -> Option<Session> {
+    read_turn_from(agent, path, DEEP_TAIL)
+}
+
+fn read_turn_from(agent: usize, path: &Path, tail: u64) -> Option<Session> {
+    let lines = tail_lines(path, tail)?;
     let mut turn = if agent == 0 {
         claude_turn(&lines)?
     } else {
@@ -112,9 +147,9 @@ fn recent(dir: &Path, depth: u8) -> Vec<PathBuf> {
     found
 }
 
-fn tail_lines(path: &Path) -> Option<Vec<String>> {
+fn tail_lines(path: &Path, tail: u64) -> Option<Vec<String>> {
     let mut file = File::open(path).ok()?;
-    let start = file.metadata().ok()?.len().saturating_sub(TAIL);
+    let start = file.metadata().ok()?.len().saturating_sub(tail);
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
@@ -155,6 +190,8 @@ fn timestamp(entry: &Value) -> Option<u64> {
 fn claude_turn(lines: &[String]) -> Option<Session> {
     let (mut busy, mut since, mut tool, mut cwd) = (false, 0, None, None);
     let (mut end, mut prompt) = (0, None);
+    // Streaming writes one response several times: count each message id once.
+    let mut spent: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for line in lines {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -194,6 +231,7 @@ fn claude_turn(lines: &[String]) -> Option<Session> {
                         if !busy {
                             since = time;
                             prompt = Some(prompt_text(text));
+                            spent.clear();
                         }
                         busy = true;
                         tool = None;
@@ -202,6 +240,11 @@ fn claude_turn(lines: &[String]) -> Option<Session> {
                 }
             }
             Some("assistant") => {
+                if let Some(id) = entry.pointer("/message/id").and_then(Value::as_str)
+                    && let Some(usage) = entry.pointer("/message/usage")
+                {
+                    spent.insert(id.to_owned(), claude_tokens(usage));
+                }
                 match entry
                     .pointer("/message/stop_reason")
                     .and_then(Value::as_str)
@@ -214,6 +257,9 @@ fn claude_turn(lines: &[String]) -> Option<Session> {
                         if !busy {
                             since = time;
                             prompt = None; // the tail starts mid-turn: the prompt is out of view
+                            spent.retain(|id, _| {
+                                entry.pointer("/message/id").and_then(Value::as_str) == Some(id)
+                            });
                         }
                         busy = true;
                         end = time;
@@ -242,6 +288,7 @@ fn claude_turn(lines: &[String]) -> Option<Session> {
         busy,
         end,
         prompt,
+        tokens: spent.values().sum(),
     })
 }
 
@@ -257,6 +304,8 @@ fn codex_project(line: &str) -> Option<String> {
 fn codex_turn(lines: &[String]) -> Option<Session> {
     let (mut busy, mut since, mut tool) = (false, 0, None);
     let (mut end, mut prompt) = (0, None);
+    // The session keeps a running token total; a turn spent the difference since it started.
+    let (mut total, mut base) = (None::<u64>, None::<u64>);
     for line in lines {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -272,6 +321,21 @@ fn codex_turn(lines: &[String]) -> Option<Session> {
                 end = since;
                 tool = None;
                 prompt = None;
+                base = total;
+            }
+            (Some("event_msg"), Some("token_count")) => {
+                if let Some(now) = entry
+                    .pointer("/payload/info/total_token_usage")
+                    .and_then(codex_tokens)
+                {
+                    // A tail that starts mid-turn: count from this call on.
+                    let last = entry
+                        .pointer("/payload/info/last_token_usage")
+                        .and_then(codex_tokens)
+                        .unwrap_or(0);
+                    base.get_or_insert(now.saturating_sub(last));
+                    total = Some(now);
+                }
             }
             (Some("event_msg"), Some("task_complete")) => busy = false,
             (Some("event_msg"), Some("turn_aborted")) => {
@@ -313,6 +377,9 @@ fn codex_turn(lines: &[String]) -> Option<Session> {
         busy,
         end,
         prompt,
+        tokens: total
+            .zip(base)
+            .map_or(0, |(total, base)| total.saturating_sub(base)),
     })
 }
 
@@ -332,7 +399,8 @@ mod tests {
                 Some(name) => serde_json::json!([{"type":"tool_use","name":name}]),
                 None => serde_json::json!([{"type":"text","text":"done"}]),
             };
-            serde_json::json!({"type":"assistant","timestamp":t,"message":{"stop_reason":stop,"content":content}})
+            serde_json::json!({"type":"assistant","timestamp":t,"message":{"id":t,"stop_reason":stop,"content":content,
+                "usage":{"input_tokens":10,"cache_creation_input_tokens":100,"cache_read_input_tokens":5000,"output_tokens":40}}})
         };
         let prompt = user("2026-11-07T10:00:00Z", "fix it".into());
         let call = assistant("2026-11-07T10:00:05Z", "tool_use", Some("Bash"));
@@ -356,6 +424,8 @@ mod tests {
         assert_eq!(running.prompt.as_deref(), Some("fix it"));
         let finished = claude_turn(&lines(&[prompt.clone(), call.clone(), result, done])).unwrap();
         assert!(!finished.busy);
+        // Two responses of 150 each; cache reads are not counted.
+        assert_eq!((running.tokens, finished.tokens), (150, 300));
         assert_eq!(finished.end - finished.since, 120);
         assert_eq!(finished.prompt.as_deref(), Some("fix it"));
         let stop = user(
@@ -380,8 +450,24 @@ mod tests {
         assert!(running.busy);
         assert_eq!(running.tool.as_deref(), Some("shell"));
         assert_eq!(running.prompt.as_deref(), Some("add a login page"));
+        let count = |input: u64, output: u64| {
+            serde_json::json!({"timestamp":"2026-11-07T10:00:04Z",
+            "type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":input,"cached_input_tokens":input / 2,"output_tokens":output},
+                "last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0}}}})
+        };
+        let before = count(1000, 100); // the previous turn's running total: 600
         let done = event("2026-11-07T10:05:00Z", "task_complete");
-        let finished = codex_turn(&lines(&[started.clone(), ask, call.clone(), done])).unwrap();
+        let finished = codex_turn(&lines(&[
+            before,
+            started.clone(),
+            ask,
+            call.clone(),
+            count(3000, 300), // 1800 now
+            done,
+        ]))
+        .unwrap();
+        assert_eq!(finished.tokens, 1200);
         assert_eq!((finished.busy, finished.end - finished.since), (false, 300));
         let aborted = event("2026-11-07T10:01:00Z", "turn_aborted");
         assert!(codex_turn(&lines(&[started, call, aborted])).is_none());

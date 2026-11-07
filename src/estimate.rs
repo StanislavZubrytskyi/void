@@ -25,6 +25,8 @@ struct Message {
     id: String,
     time: u64,
     weight: f64,
+    /// Fresh input, cache writes and output; cache reads are left out.
+    tokens: u64,
     prompt: Option<String>,
     model: String,
 }
@@ -55,6 +57,19 @@ impl Estimator {
     pub fn confirmed_blocks(&mut self, now: u64) -> Vec<Record> {
         let _ = self.refresh(now);
         self.active_blocks(now)
+    }
+
+    /// Tokens spent per minute over the last eight days, each response counted once.
+    pub fn token_minutes(&self, now: u64) -> Vec<(u64, u64)> {
+        let since = now.saturating_sub(8 * 86_400);
+        let mut seen = std::collections::HashSet::new();
+        let mut minutes = std::collections::BTreeMap::new();
+        for message in self.files.values().flat_map(|file| file.messages.iter()) {
+            if message.time >= since && seen.insert(message.id.as_str()) {
+                *minutes.entry(message.time - message.time % 60).or_insert(0) += message.tokens;
+            }
+        }
+        minutes.into_iter().collect()
     }
 
     fn active_blocks(&self, now: u64) -> Vec<Record> {
@@ -213,6 +228,9 @@ fn parse_line(line: &[u8], state: &mut FileState) {
             id: id.to_owned(),
             time,
             weight,
+            tokens: (tokens("input_tokens")
+                + tokens("cache_creation_input_tokens")
+                + tokens("output_tokens")) as u64,
             prompt: state.prompt.clone(),
             model: model.to_owned(),
         });
@@ -387,6 +405,7 @@ mod tests {
             id: id.into(),
             time,
             weight,
+            tokens: 0,
             prompt: Some(prompt.into()),
             model: "claude-opus-5-5".into(),
         }

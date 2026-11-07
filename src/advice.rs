@@ -2,6 +2,7 @@
 
 use crate::{
     duration,
+    i18n::s,
     usage::{self, Limit, Limits, Record, SelectLimit},
 };
 
@@ -13,7 +14,13 @@ fn seven_day(limits: &Limits) -> Option<Limit> {
     limits.seven_day
 }
 
-pub const WINDOWS: [(&str, SelectLimit); 2] = [("5 год", five_hour), ("7 днів", seven_day)];
+/// The two quota windows, named in the interface language.
+pub fn windows() -> [(&'static str, SelectLimit); 2] {
+    [
+        (s("5 год", "5 ч", "5 h"), five_hour),
+        (s("7 днів", "7 дней", "7 days"), seven_day),
+    ]
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Tone {
@@ -42,13 +49,13 @@ pub struct Status {
 }
 
 pub fn assess(records: &[Record], time: u64) -> Status {
-    let blocked = WINDOWS
+    let blocked = windows()
         .iter()
         .filter_map(|(name, select)| {
             usage::blocked_until(records, *select, time).map(|reset| (*name, reset))
         })
         .max_by_key(|(_, reset)| *reset);
-    let forecasts = WINDOWS.map(|(name, select)| (name, usage::forecast(records, select, time)));
+    let forecasts = windows().map(|(name, select)| (name, usage::forecast(records, select, time)));
     let risk = forecasts
         .iter()
         .filter_map(|(window, forecast)| {
@@ -83,7 +90,7 @@ pub fn assess(records: &[Record], time: u64) -> Status {
                 .min_by(|a, b| a.1.total_cmp(&b.1))
         })
         .flatten();
-    let used = WINDOWS
+    let used = windows()
         .iter()
         .filter_map(|(_, select)| usage::last_window(records, *select))
         .filter(|(limit, seen)| {
@@ -134,7 +141,7 @@ fn say(title: String, detail: String, tone: Tone) -> Speech {
 
 /// "18:50", "завтра 09:00" or "пт 12:00": the clock without the preposition.
 fn until(at: u64, time: u64, offset: i64) -> String {
-    clock(at, time, offset).replacen("о ", "", 1)
+    moment(at, time, offset, false)
 }
 
 /// The single most useful thing to say about both agents right now.
@@ -157,9 +164,11 @@ pub fn speech(agents: [(&str, &Status); 2], time: u64, offset: i64) -> Speech {
     match blocked.as_slice() {
         [(a, reset_a), (b, reset_b)] => {
             return say(
-                "Обидва на паузі".into(),
-                format!(
+                s("Обидва на паузі", "Оба на паузе", "Both are paused").into(),
+                t!(
                     "{a} до {} · {b} до {}",
+                    "{a} до {} · {b} до {}",
+                    "{a} until {} · {b} until {}",
                     until(*reset_a, time, offset),
                     until(*reset_b, time, offset)
                 ),
@@ -169,11 +178,25 @@ pub fn speech(agents: [(&str, &Status); 2], time: u64, offset: i64) -> Speech {
         [(name, reset)] => {
             let (other_name, other_status) = other(name);
             return say(
-                format!("{name} на паузі до {}", until(*reset, time, offset)),
+                t!(
+                    "{name} на паузі до {}",
+                    "{name} на паузе до {}",
+                    "{name} paused until {}",
+                    until(*reset, time, offset)
+                ),
                 if free(other_status) {
-                    format!("{other_name} вільний — працюй там")
+                    t!(
+                        "{other_name} вільний — працюй там",
+                        "{other_name} свободен — работай там",
+                        "{other_name} is free — work there"
+                    )
                 } else {
-                    format!("Доступ повернеться через {}", countdown(*reset, time))
+                    t!(
+                        "Доступ повернеться через {}",
+                        "Доступ вернётся через {}",
+                        "Access returns in {}",
+                        countdown(*reset, time)
+                    )
                 },
                 Tone::Blocked,
             );
@@ -191,20 +214,36 @@ pub fn speech(agents: [(&str, &Status); 2], time: u64, offset: i64) -> Speech {
         let reset = clock(risk.reset_at, time, offset);
         // Opus spends the quota about 5/3 as fast as Sonnet; suggest it only with a clear margin.
         let detail = if status.opus && risk.minutes * 5.0 / 3.0 >= reset_minutes * 1.1 {
-            format!(
+            t!(
                 "На Sonnet вистачить до {}",
+                "На Sonnet хватит до {}",
+                "On Sonnet it lasts until {}",
                 until(risk.reset_at, time, offset)
             )
         } else if free(other_status) {
-            format!("{other_name} вільний — переходь туди")
+            t!(
+                "{other_name} вільний — переходь туди",
+                "{other_name} свободен — переходи туда",
+                "{other_name} is free — switch there"
+            )
         } else if let Some(count) = risk.prompts {
-            format!("Це ≈ {count:.0} запитів, оновлення {reset}")
+            t!(
+                "Це ≈ {count:.0} запитів, оновлення {reset}",
+                "Это ≈ {count:.0} запросов, обновление {reset}",
+                "That is ≈ {count:.0} prompts, resets {reset}"
+            )
         } else {
-            format!("Квота оновиться {reset}")
+            t!(
+                "Квота оновиться {reset}",
+                "Квота обновится {reset}",
+                "Quota resets {reset}"
+            )
         };
         return say(
-            format!(
+            t!(
                 "{name} закінчиться {}",
+                "{name} закончится {}",
+                "{name} runs out {}",
                 clock(time + (risk.minutes * 60.0) as u64, time, offset)
             ),
             detail,
@@ -218,21 +257,46 @@ pub fn speech(agents: [(&str, &Status); 2], time: u64, offset: i64) -> Speech {
         .min()
     {
         return say(
-            "Все гаразд, працюй".into(),
-            format!("Квоти вистачить до {}", until(reset, time, offset)),
+            s(
+                "Все гаразд, працюй",
+                "Всё хорошо, работай",
+                "All good, keep working",
+            )
+            .into(),
+            t!(
+                "Квоти вистачить до {}",
+                "Квоты хватит до {}",
+                "Quota lasts until {}",
+                until(reset, time, offset)
+            ),
             Tone::Calm,
         );
     }
     if agents.into_iter().any(|(_, status)| status.used.is_some()) {
         return say(
-            "Ще придивляюся".into(),
-            "Прогноз буде за кілька запитів".into(),
+            s("Ще придивляюся", "Ещё присматриваюсь", "Still watching").into(),
+            s(
+                "Прогноз буде за кілька запитів",
+                "Прогноз будет через несколько запросов",
+                "A forecast comes after a few prompts",
+            )
+            .into(),
             Tone::Unknown,
         );
     }
     say(
-        "Поки нічого не бачу".into(),
-        "Попрацюй у Claude Code чи Codex".into(),
+        s(
+            "Поки нічого не бачу",
+            "Пока ничего не вижу",
+            "Nothing to see yet",
+        )
+        .into(),
+        s(
+            "Попрацюй у Claude Code чи Codex",
+            "Поработай в Claude Code или Codex",
+            "Work in Claude Code or Codex",
+        )
+        .into(),
         Tone::Unknown,
     )
 }
@@ -246,34 +310,41 @@ pub fn per_day(limit: Limit, time: u64) -> f64 {
 pub fn countdown(reset: u64, now: u64) -> String {
     let seconds = reset.saturating_sub(now);
     if seconds < 60 {
-        return format!("{seconds} с");
+        return t!("{seconds} с", "{seconds} с", "{seconds} s");
     }
     duration(seconds.div_ceil(60) as f64)
 }
 
 /// "о 18:40", "завтра о 09:00" or "пт о 12:00" in local time.
 pub fn clock(at: u64, now: u64, offset: i64) -> String {
+    moment(at, now, offset, true)
+}
+
+fn moment(at: u64, now: u64, offset: i64, preposition: bool) -> String {
     let local = |t: u64| t as i64 + offset;
     let (at_local, now_local) = (local(at), local(now));
     let minutes = at_local.rem_euclid(86_400) / 60;
-    let time = format!("о {:02}:{:02}", minutes / 60, minutes % 60);
+    let hm = format!("{:02}:{:02}", minutes / 60, minutes % 60);
+    let time = if preposition {
+        t!("о {hm}", "в {hm}", "at {hm}")
+    } else {
+        hm
+    };
     match at_local.div_euclid(86_400) - now_local.div_euclid(86_400) {
         0 => time,
-        1 => format!("завтра {time}"),
+        1 => t!("завтра {time}", "завтра {time}", "tomorrow {time}"),
         days if days < 8 => {
-            const WEEKDAYS: [&str; 7] = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"];
             // 1970-01-01 was a Thursday.
             let weekday = (at_local.div_euclid(86_400) + 3).rem_euclid(7) as usize;
-            format!("{} {time}", WEEKDAYS[weekday])
+            let name = match crate::i18n::lang() {
+                crate::i18n::Lang::Uk => ["пн", "вт", "ср", "чт", "пт", "сб", "нд"],
+                crate::i18n::Lang::Ru => ["пн", "вт", "ср", "чт", "пт", "сб", "вс"],
+                crate::i18n::Lang::En => ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+            }[weekday];
+            format!("{name} {time}")
         }
-        _ => format!("через {}", countdown(at, now)),
+        _ => t!("через {}", "через {}", "in {}", countdown(at, now)),
     }
-}
-
-/// "18:40" in local time, for the small label above the cat.
-pub fn hhmm(at: u64, offset: i64) -> String {
-    let minutes = (at as i64 + offset).rem_euclid(86_400) / 60;
-    format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 /// Seconds east of UTC right now.
@@ -333,7 +404,6 @@ mod tests {
         assert_eq!(clock(noon + 3 * 3600, noon, 2 * 3600), "о 17:00");
         assert_eq!(clock(noon + 86_400, noon, 0), "завтра о 12:00");
         assert_eq!(clock(noon + 3 * 86_400, noon, 0), "пн о 12:00");
-        assert_eq!(hhmm(noon + 5 * 60, 3 * 3600), "15:05");
     }
 
     fn risky(time: u64, minutes: f64, opus: bool) -> Status {

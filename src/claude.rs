@@ -1,5 +1,8 @@
 //! Quota from an existing Claude Code login. This endpoint is undocumented.
-use crate::usage::{Limit, Limits, Sample};
+use crate::{
+    i18n::s,
+    usage::{Limit, Limits, Sample},
+};
 use serde_json::Value;
 use std::{
     fs,
@@ -19,12 +22,24 @@ pub enum Failure {
 impl Failure {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Login => "Немає джерела квот",
-            Self::Expired => "Вхід Claude завершився",
-            Self::Denied => "Доступ до квот відхилено",
-            Self::Network => "Немає зв’язку",
-            Self::Unavailable => "Квоти недоступні",
-            Self::Format => "Невідомий формат",
+            Self::Login => s(
+                "Немає джерела квот",
+                "Нет источника квот",
+                "No quota source",
+            ),
+            Self::Expired => s(
+                "Вхід Claude завершився",
+                "Вход Claude истёк",
+                "Claude login expired",
+            ),
+            Self::Denied => s(
+                "Доступ до квот відхилено",
+                "Доступ к квотам отклонён",
+                "Quota access denied",
+            ),
+            Self::Network => s("Немає зв’язку", "Нет связи", "No connection"),
+            Self::Unavailable => s("Квоти недоступні", "Квоты недоступны", "Quota unavailable"),
+            Self::Format => s("Невідомий формат", "Неизвестный формат", "Unknown format"),
         }
     }
 }

@@ -14,7 +14,7 @@ Rust · Windows · Local first · MIT
 
 ## What Void does
 
-Click the cat to open a compact monochrome glass panel. Switch between **Claude** and **Codex**: the headline is how much of the tighter limit is left ("86% лишилось"), followed by which limit that is, when it resets, and a personal forecast once enough measurements exist. Subscriptions report percentages, not token counts, so Void shows percentages. The panel closes by itself after 30 seconds without the pointer on it.
+Click the cat to open the menu. It answers one question — what you have and what you've spent: a one-line verdict from the cat, then one line per agent with how much of the tighter limit is left ("74%"), which limit and when it resets, and the tokens spent in the current five-hour and weekly windows ("Витрачено 282 тис. за 5 год · 1,8 млн за тиждень"). Subscriptions report quota as percentages; token counts come from the agents' local transcripts (fresh input, cache writes and output). Claude chat on the web or phone shares the quota but isn't in those transcripts. The menu closes after 30 seconds without the pointer on it or the cat, and at once when you click another window. The gear opens settings.
 
 - Separate five-hour and weekly limits for each provider.
 - Time and typical prompts remaining, based on observed consumption.
@@ -23,7 +23,9 @@ Click the cat to open a compact monochrome glass panel. Switch between **Claude*
 - Transparent animated cat, draggable across the desktop.
 - Windows system tray, optional startup and notifications; no taskbar button.
 - Explicit missing and stale data. Unknown values stay unknown.
-- A thought bubble above the cat while Claude Code or Codex is working. Hover it for each running turn: project, elapsed time, current tool, and a forecast from your own past turns with similar prompts ("схожі: ще ≈ 6 хв · ≈ 4% квоти").
+- A thought bubble above the cat while Claude Code or Codex is working. Hover it for each running turn: project, elapsed time, your prompt, the current tool, tokens spent so far (fresh input, cache writes and output; cache reads excluded), both quota limits, and — once there is history — a forecast from your own past turns with similar prompts ("схожі: ще ≈ 6 хв · ≈ 4% квоти").
+- A soft chime when an agent finishes a turn: warmer for Claude, brighter for Codex.
+- Settings behind the gear in the panel: interface language (Українська, Русский, English) and the finish sound, saved in `~/.void/settings.json`.
 - Advice on where the next task should go, from how many typical turns each agent's five-hour quota still holds.
 
 ## Install on Windows
