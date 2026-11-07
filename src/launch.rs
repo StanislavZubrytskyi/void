@@ -1,25 +1,28 @@
-//! Starting a task: opens the agent's own interactive CLI in a new terminal window, in the
-//! chosen project, with the prompt as its first message. The user sees the work and approves
-//! the agent's actions there, exactly as if they had typed the command themselves.
+//! Starting a task in the desktop app the user works in: a new Claude Code session in Claude
+//! Desktop, or a new thread in the Codex app, in the chosen project, with the text filled in.
+//! Void only opens the app's own link (`claude://code/new`, `codex://threads/new`); the app
+//! takes it from there, so its usual review and approvals apply.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Long enough for a real task description, short enough to stay a command-line argument.
-const MAX_PROMPT: usize = 8000;
+/// The apps trim long prompts themselves; keep the link well inside command-line limits.
+const MAX_PROMPT: usize = 4000;
 
 #[derive(Debug, PartialEq)]
 pub enum Failure {
     Empty,
     TooLong,
     NoProject,
-    NoAgent,
-    Start,
+    NoApp,
 }
+
+/// The desktop app each agent runs in.
+pub const APPS: [&str; 2] = ["Claude", "Codex"];
 
 impl Failure {
     pub fn label(&self, agent: usize) -> String {
         use crate::i18n::s;
-        let name = ["Claude", "Codex"][agent];
+        let app = APPS[agent.min(1)];
         match self {
             Self::Empty => s(
                 "Напиши, що зробити",
@@ -39,15 +42,10 @@ impl Failure {
                 "Project folder not found",
             )
             .into(),
-            Self::NoAgent => t!(
-                "{name} не встановлено",
-                "{name} не установлен",
-                "{name} is not installed"
-            ),
-            Self::Start => t!(
-                "Не вдалося запустити {name}",
-                "Не удалось запустить {name}",
-                "Couldn't start {name}"
+            Self::NoApp => t!(
+                "Не вдалося відкрити {app}",
+                "Не удалось открыть {app}",
+                "Couldn't open {app}"
             ),
         }
     }
@@ -68,59 +66,72 @@ fn check(project: &Path, prompt: &str) -> Result<String, Failure> {
     Ok(prompt.to_owned())
 }
 
-/// Claude Code's executable: an explicit override, then PATH, then the native and npm installs.
-fn claude_binary() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("VOID_CLAUDE_BIN").map(PathBuf::from)
-        && path.is_absolute()
-        && path.is_file()
-    {
-        return Some(path);
+/// Percent-encodes everything but the unreserved URL characters, as UTF-8.
+fn encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
     }
-    let name = if cfg!(windows) {
-        "claude.exe"
-    } else {
-        "claude"
-    };
-    let on_path = std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .filter(|entry| entry.is_absolute())
-            .map(|entry| entry.join(name))
-            .find(|path| path.is_file())
-    });
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from);
-    let native = home.map(|home| home.join(".local").join("bin").join(name));
-    let npm = std::env::var_os("APPDATA").map(|appdata| {
-        PathBuf::from(appdata)
-            .join("npm/node_modules/@anthropic-ai/claude-code/bin")
-            .join(name)
-    });
-    on_path
-        .or(native.filter(|path| path.is_file()))
-        .or(npm.filter(|path| path.is_file()))
+    out
 }
 
-/// Opens agent 0 (Claude) or 1 (Codex) in a new terminal in `project`, starting with `prompt`.
+/// The app link that opens a new task for agent 0 (Claude) or 1 (Codex).
+fn link(agent: usize, project: &Path, prompt: &str) -> String {
+    let (text, folder) = (encode(prompt), encode(&project.to_string_lossy()));
+    if agent == 0 {
+        format!("claude://code/new?q={text}&folder={folder}")
+    } else {
+        format!("codex://threads/new?prompt={text}&path={folder}")
+    }
+}
+
+/// Opens a new task for agent 0 (Claude) or 1 (Codex) in its desktop app.
 pub fn start(agent: usize, project: &Path, prompt: &str) -> Result<(), Failure> {
     let prompt = check(project, prompt)?;
-    let binary = if agent == 0 {
-        claude_binary()
+    open(&link(agent, project, &prompt))
+}
+
+/// Hands the link to the system, which passes it to the app registered for it. No shell is
+/// involved, so nothing in the prompt can be read as a command.
+#[cfg(windows)]
+fn open(url: &str) -> Result<(), Failure> {
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (verb, target) = (wide("open"), wide(url));
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecute reports success with a value above 32.
+    if result as isize > 32 {
+        Ok(())
     } else {
-        crate::codex::codex_binary()
+        Err(Failure::NoApp)
     }
-    .ok_or(Failure::NoAgent)?;
-    let mut command = std::process::Command::new(binary);
-    // The prompt is one argument handed straight to the executable, never through a shell.
-    command.arg(prompt).current_dir(project);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0000_0010); // CREATE_NEW_CONSOLE: the agent gets its own window
-    }
-    // shortcut: outside Windows the agent starts without a terminal of its own; give it one
-    // (a terminal emulator command) when the macOS and Linux builds ship.
-    command.spawn().map(|_| ()).map_err(|_| Failure::Start)
+}
+
+#[cfg(not(windows))]
+fn open(url: &str) -> Result<(), Failure> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| Failure::NoApp)
 }
 
 #[cfg(test)]
@@ -142,6 +153,20 @@ mod tests {
         assert_eq!(
             check(&here, "  fix the login \n"),
             Ok("fix the login".to_owned())
+        );
+    }
+
+    #[test]
+    fn links_carry_the_text_and_folder_safely() {
+        assert_eq!(encode("a b/ä&q=1"), "a%20b%2F%C3%A4%26q%3D1");
+        let folder = Path::new(r"D:\work\site");
+        assert_eq!(
+            link(0, folder, "fix it"),
+            "claude://code/new?q=fix%20it&folder=D%3A%5Cwork%5Csite"
+        );
+        assert_eq!(
+            link(1, folder, "fix it"),
+            "codex://threads/new?prompt=fix%20it&path=D%3A%5Cwork%5Csite"
         );
     }
 }

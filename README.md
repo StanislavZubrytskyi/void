@@ -16,7 +16,9 @@ Rust · Windows · Local first · MIT
 
 Click the cat to open the menu. It answers one question: can I use each agent right now, and what is left? At the top, one line built from the same data as the agent below it. Tabs switch between Claude and Codex; each tab carries a dot in that agent's status color. The chosen agent shows its status (Ready to work, Running low, Paused until 19:28, or why there is no data) and its two limits side by side, the five-hour window and the weekly one: how much is left, a bar, when it resets, and how many tokens were spent in that window. Subscriptions report quota as percentages; token counts come from the agents' local transcripts (fresh input, cache writes and output). Claude chat on the web or phone shares the quota but is not in those transcripts. The menu closes after 30 seconds without the pointer on it or the cat, and at once when you click another window. The gear opens settings.
 
-Rest the pointer on the sleeping cat to start a task. Pick the agent and the project (its most recent one by default, from its own local history), write what to do, and press Enter (Shift+Enter for a new line). Void opens the agent's own interactive CLI in a new terminal window in that folder, with your text as the first message, so you see the work and approve its actions there. Esc closes the composer and keeps the draft. `VOID_CLAUDE_BIN` overrides where Claude Code is found, like `VOID_CODEX_BIN` for Codex.
+Rest the pointer on the sleeping cat to start a task. Pick the agent and the project (its most recent one by default, from its own local history), write what to do, and press Enter (Shift+Enter for a new line). Void opens the task in the desktop app you work in, through the app's own link: a new Claude Code session in Claude Desktop (`claude://code/new`) or a new thread in the Codex app (`codex://threads/new`), in that folder with your text filled in. The app takes it from there, with its usual review and approvals. Esc or the cross closes the composer and keeps the draft.
+
+Every window is built from the same parts: one glass surface (with a thin line in the agent's color on agent windows), one header, one switch for tabs, language and agent choice, one field shape, and one filled button.
 
 - Separate five-hour and weekly limits for each provider.
 - Time and typical prompts remaining, based on observed consumption.
@@ -99,7 +101,6 @@ The first command reports source availability. The second observes background up
 |---|---|
 | `VOID_DATA_DIR` | Override the default `~/.void` history directory |
 | `VOID_CODEX_BIN` | Absolute path to the Codex binary |
-| `VOID_CLAUDE_BIN` | Absolute path to the Claude Code binary, for starting tasks |
 | `VOID_REDUCED_MOTION=1` | Disable continuous cat animation |
 | `VOID_NO_PROMPTS=1` | Remember finished turns without their prompt text |
 | `CODEX_HOME` | Existing Codex configuration/session location |

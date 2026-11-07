@@ -471,6 +471,159 @@ fn gradient(painter: &egui::Painter, rect: Rect, radius: f32, top: Color32, bott
     }
 }
 
+/// The glass surface every Void window stands on. `accent` draws the agent's thin top line.
+fn glass(painter: &egui::Painter, rect: Rect, accent: Option<Color32>) {
+    painter.add(
+        Shadow {
+            offset: [0, 10],
+            blur: 24,
+            spread: 0,
+            color: Color32::from_black_alpha(110),
+        }
+        .as_shape(rect, RADIUS),
+    );
+    gradient(painter, rect, RADIUS, GLASS_TOP, GLASS_BOTTOM);
+    painter.rect_stroke(
+        rect,
+        RADIUS,
+        Stroke::new(1.0, Color32::from_white_alpha(28)),
+        StrokeKind::Inside,
+    );
+    if let Some(color) = accent {
+        painter.line_segment(
+            [
+                Pos2::new(rect.left() + RADIUS, rect.top() + 0.5),
+                Pos2::new(rect.right() - RADIUS, rect.top() + 0.5),
+            ],
+            Stroke::new(1.5, color.gamma_multiply(0.7)),
+        );
+    }
+}
+
+/// The header every window opens with: a title and one quieter line under it.
+fn header(painter: &egui::Painter, left: f32, top: f32, width: f32, title: String, detail: String) {
+    let title = painter.layout(title, strong(15.5), LABEL, width);
+    painter.galley(Pos2::new(left, top), title, LABEL);
+    let detail = painter.layout(detail, regular(11.5), SECONDARY, width);
+    painter.galley(Pos2::new(left, top + 24.0), detail, SECONDARY);
+}
+
+/// The one switch used everywhere (agent tabs, language, agent choice): a dark track with the
+/// chosen cell lifted, each option with an optional colored dot. Returns the option clicked.
+fn segmented(
+    ui: &egui::Ui,
+    track: Rect,
+    id: &str,
+    options: &[(&str, Option<Color32>)],
+    chosen: usize,
+) -> Option<usize> {
+    let painter = ui.painter();
+    painter.rect_filled(track, 10.0, Color32::from_black_alpha(65));
+    let width = track.width() / options.len() as f32;
+    let mut clicked = None;
+    for (i, (label, dot)) in options.iter().enumerate() {
+        let cell = Rect::from_min_size(
+            track.min + Vec2::new(i as f32 * width, 0.0),
+            Vec2::new(width, track.height()),
+        )
+        .shrink(3.0);
+        let response = ui
+            .interact(cell, ui.id().with((id, i)), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, chosen == i, *label)
+        });
+        if response.clicked() && chosen != i {
+            clicked = Some(i);
+        }
+        if chosen == i {
+            gradient(
+                painter,
+                cell,
+                8.0,
+                Color32::from_white_alpha(38),
+                Color32::from_white_alpha(18),
+            );
+        } else if response.hovered() {
+            painter.rect_filled(cell, 8.0, Color32::from_white_alpha(8));
+        }
+        let text = painter.layout_no_wrap((*label).to_owned(), strong(12.5), LABEL);
+        let lead = if dot.is_some() { 12.0 } else { 0.0 };
+        let start = cell.center().x - (text.size().x + lead) / 2.0;
+        if let Some(color) = dot {
+            painter.circle_filled(Pos2::new(start + 3.0, cell.center().y), 3.5, *color);
+        }
+        painter.galley(
+            Pos2::new(start + lead, cell.center().y - text.size().y / 2.0),
+            text,
+            if chosen == i { LABEL } else { SECONDARY },
+        );
+    }
+    clicked
+}
+
+/// The square icon button in a window's header: the gear, the close cross.
+fn icon_button(ui: &egui::Ui, rect: Rect, id: &str, icon: &str, active: bool, label: &str) -> bool {
+    let painter = ui.painter();
+    let response = ui
+        .interact(rect, ui.id().with(id), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, label));
+    let lit = active || response.hovered();
+    if lit {
+        painter.rect_filled(
+            rect,
+            9.0,
+            Color32::from_white_alpha(if active { 34 } else { 14 }),
+        );
+    }
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        regular(15.0),
+        if lit { LABEL } else { SECONDARY },
+    );
+    response.clicked()
+}
+
+/// The one filled button: in the agent's color, dark text, lighter under the pointer.
+fn primary_button(ui: &egui::Ui, rect: Rect, id: &str, label: &str, color: Color32) -> bool {
+    let painter = ui.painter();
+    let response = ui
+        .interact(rect, ui.id().with(id), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let fill = if response.hovered() {
+        mix(color, Color32::WHITE, 0.18)
+    } else {
+        color
+    };
+    painter.rect_filled(rect, 10.0, fill);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        strong(12.5),
+        Color32::from_gray(20),
+    );
+    response.clicked()
+}
+
+/// A field: the same dark track as the switch, so inputs read as one family.
+fn field(painter: &egui::Painter, rect: Rect, focused: bool) {
+    painter.rect_filled(rect, 10.0, Color32::from_black_alpha(65));
+    if focused {
+        painter.rect_stroke(
+            rect,
+            10.0,
+            Stroke::new(1.0, Color32::from_white_alpha(46)),
+            StrokeKind::Inside,
+        );
+    }
+}
+
 /// A choice made in the settings view, for the app to apply and save.
 pub enum Action {
     Language(crate::i18n::Lang),
@@ -490,59 +643,22 @@ pub fn draw(
 ) -> (Rect, Option<Action>) {
     let painter = ui.painter();
     let rect = Rect::from_min_max(bottom_right - menu.size, bottom_right);
-    painter.add(
-        Shadow {
-            offset: [0, 10],
-            blur: 24,
-            spread: 0,
-            color: Color32::from_black_alpha(110),
-        }
-        .as_shape(rect, RADIUS),
-    );
-    gradient(painter, rect, RADIUS, GLASS_TOP, GLASS_BOTTOM);
-    painter.rect_stroke(
-        rect,
-        RADIUS,
-        Stroke::new(1.0, Color32::from_white_alpha(28)),
-        StrokeKind::Inside,
-    );
+    glass(painter, rect, None);
     let (left, right) = (rect.left() + PAD + 4.0, rect.right() - PAD - 4.0);
     let top = rect.top() + PAD;
 
     // Header: the verdict, or the settings title, and the gear.
     let gear = Rect::from_min_size(Pos2::new(right - 30.0, top - 4.0), Vec2::splat(30.0));
-    let response = ui
-        .interact(gear, ui.id().with("settings"), egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::WidgetType::SelectableLabel,
-            true,
-            *settings_open,
-            s("Налаштування", "Настройки", "Settings"),
-        )
-    });
-    if response.clicked() {
+    if icon_button(
+        ui,
+        gear,
+        "settings",
+        if *settings_open { "✕" } else { "⚙" },
+        *settings_open,
+        s("Налаштування", "Настройки", "Settings"),
+    ) {
         *settings_open = !*settings_open;
     }
-    if *settings_open || response.hovered() {
-        painter.rect_filled(
-            gear,
-            9.0,
-            Color32::from_white_alpha(if *settings_open { 34 } else { 14 }),
-        );
-    }
-    painter.text(
-        gear.center(),
-        egui::Align2::CENTER_CENTER,
-        if *settings_open { "✕" } else { "⚙" },
-        regular(15.0),
-        if *settings_open || response.hovered() {
-            LABEL
-        } else {
-            SECONDARY
-        },
-    );
     let (title, detail) = if *settings_open {
         (
             s("Налаштування", "Настройки", "Settings").to_owned(),
@@ -551,10 +667,7 @@ pub fn draw(
     } else {
         (menu.title.clone(), menu.detail.clone())
     };
-    let title = painter.layout(title, strong(15.5), LABEL, right - left - 40.0);
-    painter.galley(Pos2::new(left, top), title, LABEL);
-    let detail = painter.layout(detail, regular(11.5), SECONDARY, right - left - 40.0);
-    painter.galley(Pos2::new(left, top + 24.0), detail, SECONDARY);
+    header(painter, left, top, right - left - 40.0, title, detail);
 
     let area = Rect::from_min_max(
         Pos2::new(left, top + HEADER - 8.0),
@@ -569,47 +682,18 @@ pub fn draw(
             Pos2::new(left, area.top() + 4.0),
             Vec2::new(right - left, 32.0),
         );
-        painter.rect_filled(tabs, 10.0, Color32::from_black_alpha(65));
-        for (i, row) in menu.rows.iter().enumerate() {
-            let cell = Rect::from_min_size(
-                tabs.min + Vec2::new(i as f32 * tabs.width() / 2.0, 0.0),
-                Vec2::new(tabs.width() / 2.0, tabs.height()),
-            )
-            .shrink(3.0);
-            let response = ui
-                .interact(cell, ui.id().with(("agent-tab", i)), egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            let name = ["Claude", "Codex"][row.agent];
-            response.widget_info(|| {
-                egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, *tab == i, name)
-            });
-            if response.clicked() {
-                *tab = i;
-            }
-            if *tab == i {
-                gradient(
-                    painter,
-                    cell,
-                    8.0,
-                    Color32::from_white_alpha(38),
-                    Color32::from_white_alpha(18),
-                );
-            } else if response.hovered() {
-                painter.rect_filled(cell, 8.0, Color32::from_white_alpha(8));
-            }
-            let label = painter.layout_no_wrap(name.to_owned(), strong(12.5), LABEL);
-            let width = label.size().x + 12.0;
-            let start = cell.center().x - width / 2.0;
-            painter.circle_filled(
-                Pos2::new(start + 3.0, cell.center().y),
-                3.5,
-                verdict_color(row.verdict),
-            );
-            painter.galley(
-                Pos2::new(start + 12.0, cell.center().y - label.size().y / 2.0),
-                label,
-                if *tab == i { LABEL } else { SECONDARY },
-            );
+        let options: Vec<(&str, Option<Color32>)> = menu
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    ["Claude", "Codex"][row.agent],
+                    Some(verdict_color(row.verdict)),
+                )
+            })
+            .collect();
+        if let Some(i) = segmented(ui, tabs, "agent-tab", &options, *tab) {
+            *tab = i;
         }
         // The chosen agent: its status, then its two limits side by side.
         let row = &menu.rows[*tab];
@@ -688,43 +772,17 @@ fn settings_body(
         regular(11.0),
         SECONDARY,
     );
-    let row = Rect::from_min_max(Pos2::new(left, top + 22.0), Pos2::new(right, top + 52.0));
-    painter.rect_filled(row, 9.0, Color32::from_black_alpha(65));
-    let width = row.width() / 3.0;
-    for (i, lang) in crate::i18n::Lang::ALL.into_iter().enumerate() {
-        let cell = Rect::from_min_size(
-            row.min + Vec2::new(i as f32 * width, 0.0),
-            Vec2::new(width, row.height()),
-        )
-        .shrink(3.0);
-        let chosen = settings.language == lang;
-        let response = ui
-            .interact(cell, ui.id().with(("language", i)), egui::Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        response.widget_info(|| {
-            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, chosen, lang.label())
-        });
-        if response.clicked() && !chosen {
-            action = Some(Action::Language(lang));
-        }
-        if chosen {
-            gradient(
-                painter,
-                cell,
-                7.0,
-                Color32::from_white_alpha(38),
-                Color32::from_white_alpha(18),
-            );
-        } else if response.hovered() {
-            painter.rect_filled(cell, 7.0, Color32::from_white_alpha(8));
-        }
-        painter.text(
-            cell.center(),
-            egui::Align2::CENTER_CENTER,
-            lang.label(),
-            strong(12.0),
-            if chosen { LABEL } else { SECONDARY },
-        );
+    let row = Rect::from_min_max(Pos2::new(left, top + 22.0), Pos2::new(right, top + 54.0));
+    let languages: Vec<(&str, Option<Color32>)> = crate::i18n::Lang::ALL
+        .iter()
+        .map(|lang| (lang.label(), None))
+        .collect();
+    let current = crate::i18n::Lang::ALL
+        .iter()
+        .position(|lang| *lang == settings.language)
+        .unwrap_or(0);
+    if let Some(i) = segmented(ui, row, "language", &languages, current) {
+        action = Some(Action::Language(crate::i18n::Lang::ALL[i]));
     }
     painter.text(
         Pos2::new(left, top + 70.0),
@@ -801,10 +859,14 @@ pub struct Compose {
     pub note: Option<(String, bool)>,
     /// Put the cursor in the field on the next frame.
     pub focus: bool,
+    /// The project list is open in place of the field.
+    pub picking: bool,
 }
 
+const FIELD_HEIGHT: f32 = 92.0;
+
 pub fn compose_size() -> Vec2 {
-    Vec2::new(WIDTH, 240.0)
+    Vec2::new(WIDTH, PAD + 246.0 + FIELD_HEIGHT - 88.0 + 30.0 + PAD)
 }
 
 /// Window size for the composer above the cat.
@@ -812,178 +874,245 @@ pub fn compose_window(size: Vec2) -> Vec2 {
     Vec2::new(size.x + MARGIN * 2.0, 88.0 + size.y + MARGIN + 6.0)
 }
 
-/// Draws the composer with its bottom edge just above the cat. Returns its rectangle, whether
-/// the text field has the keyboard, and the folder to start the task in when the user sends it.
+/// What the composer asks of the app this frame.
+pub struct ComposeOut {
+    pub area: Rect,
+    /// The text field has the keyboard.
+    pub typing: bool,
+    /// Start the task in this folder.
+    pub send: Option<std::path::PathBuf>,
+    pub close: bool,
+}
+
+/// Draws the composer with its bottom edge just above the cat, in the same glass, header,
+/// switch, field and button as every other window.
 pub fn compose(
     ui: &mut egui::Ui,
     bottom_right: Pos2,
     state: &mut Compose,
     projects: &[Vec<crate::projects::Project>; 2],
-) -> (Rect, bool, Option<std::path::PathBuf>) {
+) -> ComposeOut {
     let size = compose_size();
     let rect = Rect::from_min_max(bottom_right - size, bottom_right);
     let color = tint(state.agent);
+    let (left, right) = (rect.left() + PAD + 4.0, rect.right() - PAD - 4.0);
+    let top = rect.top() + PAD;
+    let mut out = ComposeOut {
+        area: rect,
+        typing: false,
+        send: None,
+        close: false,
+    };
+    let app = crate::launch::APPS[state.agent];
     {
         let painter = ui.painter();
-        painter.add(
-            Shadow {
-                offset: [0, 10],
-                blur: 24,
-                spread: 0,
-                color: Color32::from_black_alpha(110),
-            }
-            .as_shape(rect, RADIUS),
-        );
-        gradient(painter, rect, RADIUS, GLASS_TOP, GLASS_BOTTOM);
-        painter.rect_stroke(
-            rect,
-            RADIUS,
-            Stroke::new(1.0, Color32::from_white_alpha(28)),
-            StrokeKind::Inside,
-        );
-        painter.line_segment(
-            [
-                Pos2::new(rect.left() + 24.0, rect.top() + 0.5),
-                Pos2::new(rect.right() - 24.0, rect.top() + 0.5),
-            ],
-            Stroke::new(1.5, color.gamma_multiply(0.7)),
+        glass(painter, rect, Some(color));
+        header(
+            painter,
+            left,
+            top,
+            right - left - 40.0,
+            s("Нове завдання", "Новая задача", "New task").to_owned(),
+            t!(
+                "Відкриється в застосунку {app}",
+                "Откроется в приложении {app}",
+                "Opens in the {app} app"
+            ),
         );
     }
-    let inner = rect.shrink2(Vec2::new(PAD + 4.0, PAD));
-    let mut send = None;
-    let mut typing = false;
-    ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
-        let visuals = ui.visuals_mut();
-        visuals.extreme_bg_color = Color32::from_black_alpha(90);
-        visuals.widgets.inactive.corner_radius = 8.into();
-        visuals.widgets.hovered.corner_radius = 8.into();
-        visuals.widgets.active.corner_radius = 8.into();
-        visuals.selection.bg_fill = color.gamma_multiply(0.45);
-        ui.spacing_mut().item_spacing = Vec2::new(8.0, 10.0);
-
-        ui.label(
-            egui::RichText::new(s("Нове завдання", "Новая задача", "New task"))
-                .font(strong(15.5))
-                .color(LABEL),
+    let close = Rect::from_min_size(Pos2::new(right - 30.0, top - 4.0), Vec2::splat(30.0));
+    if icon_button(
+        ui,
+        close,
+        "compose-close",
+        "✕",
+        false,
+        s("Закрити", "Закрыть", "Close"),
+    ) {
+        out.close = true;
+    }
+    // Which agent.
+    let switch = Rect::from_min_size(Pos2::new(left, top + 58.0), Vec2::new(right - left, 32.0));
+    let agents = [("Claude", Some(tint(0))), ("Codex", Some(tint(1)))];
+    if let Some(agent) = segmented(ui, switch, "compose-agent", &agents, state.agent) {
+        state.agent = agent;
+        state.note = None;
+        state.picking = false;
+    }
+    // Which project: the agent's newest by default; the row opens the list.
+    let list = &projects[state.agent];
+    let chosen = state.project[state.agent]
+        .clone()
+        .filter(|path| list.iter().any(|project| &project.path == path))
+        .or_else(|| list.first().map(|project| project.path.clone()));
+    let name = chosen
+        .as_ref()
+        .and_then(|path| list.iter().find(|project| &project.path == path))
+        .map_or_else(
+            || s("немає проєктів", "нет проектов", "no projects").to_owned(),
+            |project| project.name.clone(),
         );
-        // Which agent.
-        ui.horizontal(|ui| {
-            for agent in 0..2 {
-                let name = ["Claude", "Codex"][agent];
-                let chosen = state.agent == agent;
-                let text = egui::RichText::new(name)
-                    .font(strong(12.5))
-                    .color(if chosen { LABEL } else { SECONDARY });
-                if ui
-                    .add_sized([100.0, 28.0], egui::Button::selectable(chosen, text))
-                    .clicked()
-                {
-                    state.agent = agent;
-                    state.note = None;
-                }
-            }
-        });
-        // Which project: the agent's newest by default.
-        let list = &projects[state.agent];
-        let chosen = state.project[state.agent]
-            .clone()
-            .filter(|path| list.iter().any(|project| &project.path == path))
-            .or_else(|| list.first().map(|project| project.path.clone()));
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(s("Проєкт", "Проект", "Project"))
-                    .font(regular(11.5))
-                    .color(SECONDARY),
+    let row = Rect::from_min_size(Pos2::new(left, top + 102.0), Vec2::new(right - left, 32.0));
+    let response = ui
+        .interact(row, ui.id().with("compose-project"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, name.clone()));
+    if response.clicked() {
+        state.picking = !state.picking;
+    }
+    {
+        let painter = ui.painter();
+        field(painter, row, state.picking || response.hovered());
+        painter.text(
+            Pos2::new(row.left() + 12.0, row.center().y),
+            egui::Align2::LEFT_CENTER,
+            s("Проєкт", "Проект", "Project"),
+            regular(11.5),
+            SECONDARY,
+        );
+        painter.text(
+            Pos2::new(row.right() - 30.0, row.center().y),
+            egui::Align2::RIGHT_CENTER,
+            &name,
+            strong(12.5),
+            LABEL,
+        );
+        painter.text(
+            Pos2::new(row.right() - 14.0, row.center().y),
+            egui::Align2::CENTER_CENTER,
+            if state.picking { "▴" } else { "▾" },
+            regular(11.0),
+            SECONDARY,
+        );
+    }
+    let area = Rect::from_min_size(
+        Pos2::new(left, top + 146.0),
+        Vec2::new(right - left, FIELD_HEIGHT),
+    );
+    if state.picking {
+        // The projects, newest first, in place of the field.
+        ui.painter()
+            .rect_filled(area, 10.0, Color32::from_black_alpha(65));
+        let rows = (FIELD_HEIGHT / 23.0).floor() as usize;
+        for (i, project) in list.iter().take(rows).enumerate() {
+            let line = Rect::from_min_size(
+                area.min + Vec2::new(3.0, 3.0 + i as f32 * 22.0),
+                Vec2::new(area.width() - 6.0, 22.0),
             );
-            let name = chosen
-                .as_ref()
-                .and_then(|path| list.iter().find(|project| &project.path == path))
-                .map_or_else(
-                    || s("немає проєктів", "нет проектов", "no projects").to_owned(),
-                    |project| project.name.clone(),
-                );
-            let mut picked = chosen.clone();
-            egui::ComboBox::from_id_salt(("project", state.agent))
-                .width(ui.available_width())
-                .selected_text(egui::RichText::new(name).font(strong(12.0)).color(LABEL))
-                .show_ui(ui, |ui| {
-                    for project in list {
-                        ui.selectable_value(&mut picked, Some(project.path.clone()), &project.name)
-                            .on_hover_text(project.path.display().to_string());
-                    }
-                });
-            if picked != chosen {
-                state.project[state.agent] = picked;
+            let response = ui
+                .interact(
+                    line,
+                    ui.id().with(("compose-project-row", i)),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(project.path.display().to_string());
+            let selected = chosen.as_ref() == Some(&project.path);
+            let painter = ui.painter();
+            if selected {
+                painter.rect_filled(line, 7.0, Color32::from_white_alpha(22));
+            } else if response.hovered() {
+                painter.rect_filled(line, 7.0, Color32::from_white_alpha(8));
             }
-        });
-        // What to do. Enter sends; Shift+Enter makes a new line.
-        let field = egui::TextEdit::multiline(&mut state.text)
-            .hint_text(s("Що зробити?", "Что сделать?", "What should it do?"))
+            painter.text(
+                Pos2::new(line.left() + 9.0, line.center().y),
+                egui::Align2::LEFT_CENTER,
+                &project.name,
+                strong(12.0),
+                if selected { LABEL } else { SECONDARY },
+            );
+            if response.clicked() {
+                state.project[state.agent] = Some(project.path.clone());
+                state.picking = false;
+            }
+        }
+        if list.is_empty() {
+            ui.painter().text(
+                area.center(),
+                egui::Align2::CENTER_CENTER,
+                s("Немає проєктів", "Нет проектов", "No projects"),
+                regular(11.5),
+                GRAY,
+            );
+        }
+    } else {
+        // What to do. Enter starts; Shift+Enter makes a new line.
+        field(ui.painter(), area, false);
+        let editor = egui::TextEdit::multiline(&mut state.text)
+            .frame(false)
+            .hint_text(
+                egui::RichText::new(s("Що зробити?", "Что сделать?", "What should it do?"))
+                    .color(GRAY),
+            )
             .font(regular(13.0))
-            .desired_rows(4)
-            .desired_width(f32::INFINITY)
+            .text_color(LABEL)
+            .desired_width(area.width() - 24.0)
             .return_key(Some(egui::KeyboardShortcut::new(
                 egui::Modifiers::SHIFT,
                 egui::Key::Enter,
             )));
-        let field = ui.add(field);
+        let inner = area.shrink2(Vec2::new(12.0, 10.0));
+        let response = ui.put(inner, editor);
         if state.focus {
-            field.request_focus();
+            response.request_focus();
             state.focus = false;
         }
-        typing = field.has_focus();
-        let enter = typing
-            && ui.input(|input| input.key_pressed(egui::Key::Enter) && !input.modifiers.shift);
-        ui.horizontal(|ui| {
-            if let Some((message, ok)) = &state.note {
-                ui.label(
-                    egui::RichText::new(message)
-                        .font(regular(11.0))
-                        .color(if *ok { READY } else { STOP }),
-                );
-            } else {
-                ui.label(
-                    egui::RichText::new(s(
-                        "Enter — запустити",
-                        "Enter — запустить",
-                        "Enter to start",
-                    ))
-                    .font(regular(10.5))
-                    .color(GRAY),
-                );
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let start = egui::Button::new(
-                    egui::RichText::new(s("Запустити", "Запустить", "Start"))
-                        .font(strong(12.5))
-                        .color(Color32::from_gray(20)),
-                )
-                .fill(color)
-                .min_size(Vec2::new(96.0, 28.0));
-                if ui.add(start).clicked() || enter {
-                    send = Some(chosen.clone());
-                }
-            });
-        });
-    });
-    // No project to start in: say so instead of sending.
-    let send = match send {
-        Some(Some(path)) => Some(path),
-        Some(None) => {
-            state.note = Some((
-                s(
-                    "Немає проєкту для запуску",
-                    "Нет проекта для запуска",
-                    "No project to start in",
-                )
-                .to_owned(),
-                false,
-            ));
-            None
+        out.typing = response.has_focus();
+        if out.typing {
+            // Only the outline: the fill is already under the text.
+            ui.painter().rect_stroke(
+                area,
+                10.0,
+                Stroke::new(1.0, Color32::from_white_alpha(46)),
+                StrokeKind::Inside,
+            );
         }
-        None => None,
+    }
+    let enter = out.typing
+        && ui.input(|input| input.key_pressed(egui::Key::Enter) && !input.modifiers.shift);
+    // The result of the last try, or how to send.
+    let footer = top + 146.0 + FIELD_HEIGHT + 14.0;
+    let (message, tone) = match &state.note {
+        Some((message, ok)) => (message.clone(), if *ok { READY } else { STOP }),
+        None => (
+            s("Enter — запустити", "Enter — запустить", "Enter to start").to_owned(),
+            GRAY,
+        ),
     };
-    (rect, typing, send)
+    let start = Rect::from_min_size(
+        Pos2::new(right - 108.0, footer - 2.0),
+        Vec2::new(108.0, 30.0),
+    );
+    {
+        let painter = ui.painter();
+        let note = painter.layout(message, regular(11.0), tone, start.left() - left - 10.0);
+        painter.galley(Pos2::new(left, footer + 6.0), note, tone);
+    }
+    if primary_button(
+        ui,
+        start,
+        "compose-start",
+        s("Запустити", "Запустить", "Start"),
+        color,
+    ) || enter
+    {
+        match chosen {
+            Some(path) => out.send = Some(path),
+            None => {
+                state.note = Some((
+                    s(
+                        "Немає проєкту для запуску",
+                        "Нет проекта для запуска",
+                        "No project to start in",
+                    )
+                    .to_owned(),
+                    false,
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Three little "z"s drifting up from the cat's head while it sleeps. Each rises, grows and
@@ -1245,30 +1374,7 @@ pub fn busy_card(
 ) {
     let name = ["Claude", "Codex"][agent];
     let color = tint(agent);
-    painter.add(
-        Shadow {
-            offset: [0, 8],
-            blur: 20,
-            spread: 0,
-            color: Color32::from_black_alpha(110),
-        }
-        .as_shape(rect, 16.0),
-    );
-    gradient(painter, rect, 16.0, GLASS_TOP, GLASS_BOTTOM);
-    painter.rect_stroke(
-        rect,
-        16.0,
-        Stroke::new(1.0, Color32::from_white_alpha(28)),
-        StrokeKind::Inside,
-    );
-    // A thin line in the agent's color along the top edge ties the card to its bubble.
-    painter.line_segment(
-        [
-            Pos2::new(rect.left() + 18.0, rect.top() + 0.5),
-            Pos2::new(rect.right() - 18.0, rect.top() + 0.5),
-        ],
-        Stroke::new(1.5, color.gamma_multiply(0.7)),
-    );
+    glass(painter, rect, Some(color));
     let (left, right) = (rect.left() + 16.0, rect.right() - 16.0);
     let mut y = rect.top() + 14.0;
     // A live dot, pulsing like the bubble.

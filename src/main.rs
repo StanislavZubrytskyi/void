@@ -666,25 +666,28 @@ impl eframe::App for Companion {
                 } else if self.compose.open {
                     let window = panel::compose_window(panel::compose_size());
                     if bounds.width() >= window.x - 0.5 && bounds.height() >= window.y - 0.5 {
-                        let (area, typing, send) = panel::compose(
+                        let out = panel::compose(
                             ui,
                             egui::pos2(bounds.right() - panel::MARGIN, cat_rect.top() + 4.0),
                             &mut self.compose,
                             &self.projects,
                         );
-                        self.compose_area = Some([area, cat_rect]);
-                        self.compose_typing = typing;
-                        if let Some(folder) = send {
+                        self.compose_area = Some([out.area, cat_rect]);
+                        self.compose_typing = out.typing;
+                        if out.close {
+                            self.compose_close_at = Some(clock);
+                        }
+                        if let Some(folder) = out.send {
                             let agent = self.compose.agent;
                             match launch::start(agent, &folder, &self.compose.text) {
                                 Ok(()) => {
-                                    let name = ["Claude", "Codex"][agent];
+                                    let app = launch::APPS[agent];
                                     let project = activity::folder_name(&folder.to_string_lossy());
                                     self.compose.note = Some((
                                         t!(
-                                            "Запущено: {name} · {project}",
-                                            "Запущено: {name} · {project}",
-                                            "Started: {name} · {project}"
+                                            "Відкрито в {app} · {project}",
+                                            "Открыто в {app} · {project}",
+                                            "Opened in {app} · {project}"
                                         ),
                                         true,
                                     ));
@@ -795,6 +798,7 @@ impl eframe::App for Companion {
             if close {
                 self.compose.open = false;
                 self.compose.note = None;
+                self.compose.picking = false;
                 self.compose_area = None;
                 self.compose_typing = false;
                 self.compose_away = None;
