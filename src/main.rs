@@ -85,15 +85,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("Finished turns remembered: {}", turns::load().len());
             for (agent, name) in ["Claude", "Codex"].into_iter().enumerate() {
-                let found = projects::recent(agent);
-                println!(
-                    "{name} recent projects: {}{}",
-                    found.len(),
-                    found
-                        .first()
-                        .map(|project| format!(" (latest: {})", project.name))
-                        .unwrap_or_default()
-                );
+                let found = projects::list(agent);
+                let names: Vec<String> = found
+                    .iter()
+                    .map(|project| {
+                        let mark = if project.preferred { "*" } else { "" };
+                        format!("{mark}{}", project.name)
+                    })
+                    .collect();
+                println!("{name} projects ({}): {}", found.len(), names.join(", "));
             }
             println!("Codex session samples: {}", codex::history().len());
             println!(

@@ -904,6 +904,16 @@ pub fn compose(
         close: false,
     };
     let app = crate::launch::APPS[state.agent];
+    // The model the app will start the session with, when it tells us (Claude environments do).
+    let model = {
+        let list = &projects[state.agent];
+        state.project[state.agent]
+            .as_ref()
+            .and_then(|path| list.iter().find(|project| &project.path == path))
+            .or_else(|| list.iter().find(|project| project.preferred))
+            .or(list.first())
+            .and_then(|project| project.model.clone())
+    };
     {
         let painter = ui.painter();
         glass(painter, rect, Some(color));
@@ -913,11 +923,18 @@ pub fn compose(
             top,
             right - left - 40.0,
             s("Нове завдання", "Новая задача", "New task").to_owned(),
-            t!(
-                "Відкриється в застосунку {app}",
-                "Откроется в приложении {app}",
-                "Opens in the {app} app"
-            ),
+            match model {
+                Some(model) => t!(
+                    "Відкриється в застосунку {app} · {model}",
+                    "Откроется в приложении {app} · {model}",
+                    "Opens in the {app} app · {model}"
+                ),
+                None => t!(
+                    "Відкриється в застосунку {app}",
+                    "Откроется в приложении {app}",
+                    "Opens in the {app} app"
+                ),
+            },
         );
     }
     let close = Rect::from_min_size(Pos2::new(right - 30.0, top - 4.0), Vec2::splat(30.0));
@@ -939,12 +956,17 @@ pub fn compose(
         state.note = None;
         state.picking = false;
     }
-    // Which project: the agent's newest by default; the row opens the list.
+    // Which project: the one the app has current by default; the row opens the list.
     let list = &projects[state.agent];
     let chosen = state.project[state.agent]
         .clone()
         .filter(|path| list.iter().any(|project| &project.path == path))
-        .or_else(|| list.first().map(|project| project.path.clone()));
+        .or_else(|| {
+            list.iter()
+                .find(|project| project.preferred)
+                .or(list.first())
+                .map(|project| project.path.clone())
+        });
     let name = chosen
         .as_ref()
         .and_then(|path| list.iter().find(|project| &project.path == path))
@@ -991,41 +1013,57 @@ pub fn compose(
         Vec2::new(right - left, FIELD_HEIGHT),
     );
     if state.picking {
-        // The projects, newest first, in place of the field.
+        // The projects, in the app's own order, in place of the field; scroll for more.
         ui.painter()
             .rect_filled(area, 10.0, Color32::from_black_alpha(65));
-        let rows = (FIELD_HEIGHT / 23.0).floor() as usize;
-        for (i, project) in list.iter().take(rows).enumerate() {
-            let line = Rect::from_min_size(
-                area.min + Vec2::new(3.0, 3.0 + i as f32 * 22.0),
-                Vec2::new(area.width() - 6.0, 22.0),
-            );
-            let response = ui
-                .interact(
-                    line,
-                    ui.id().with(("compose-project-row", i)),
-                    egui::Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(project.path.display().to_string());
-            let selected = chosen.as_ref() == Some(&project.path);
-            let painter = ui.painter();
-            if selected {
-                painter.rect_filled(line, 7.0, Color32::from_white_alpha(22));
-            } else if response.hovered() {
-                painter.rect_filled(line, 7.0, Color32::from_white_alpha(8));
-            }
-            painter.text(
-                Pos2::new(line.left() + 9.0, line.center().y),
-                egui::Align2::LEFT_CENTER,
-                &project.name,
-                strong(12.0),
-                if selected { LABEL } else { SECONDARY },
-            );
-            if response.clicked() {
-                state.project[state.agent] = Some(project.path.clone());
-                state.picking = false;
-            }
+        let agent = state.agent;
+        let mut picked = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(area.shrink(3.0)), |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.spacing_mut().scroll.bar_width = 4.0;
+            egui::ScrollArea::vertical()
+                .id_salt(("compose-projects", agent))
+                .show(ui, |ui| {
+                    for project in list {
+                        let (line, response) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 22.0),
+                            egui::Sense::click(),
+                        );
+                        let response = response
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(project.path.display().to_string());
+                        let selected = chosen.as_ref() == Some(&project.path);
+                        let painter = ui.painter();
+                        if selected {
+                            painter.rect_filled(line, 7.0, Color32::from_white_alpha(22));
+                        } else if response.hovered() {
+                            painter.rect_filled(line, 7.0, Color32::from_white_alpha(8));
+                        }
+                        painter.text(
+                            Pos2::new(line.left() + 9.0, line.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &project.name,
+                            strong(12.0),
+                            if selected { LABEL } else { SECONDARY },
+                        );
+                        if let Some(model) = &project.model {
+                            painter.text(
+                                Pos2::new(line.right() - 12.0, line.center().y),
+                                egui::Align2::RIGHT_CENTER,
+                                model,
+                                regular(10.5),
+                                GRAY,
+                            );
+                        }
+                        if response.clicked() {
+                            picked = Some(project.path.clone());
+                        }
+                    }
+                });
+        });
+        if let Some(path) = picked {
+            state.project[agent] = Some(path);
+            state.picking = false;
         }
         if list.is_empty() {
             ui.painter().text(

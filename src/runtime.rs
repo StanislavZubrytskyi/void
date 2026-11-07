@@ -33,7 +33,7 @@ pub fn start(ctx: eframe::egui::Context) -> Receiver<Update> {
         loop {
             if listed.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
                 listed = Some(Instant::now());
-                let found = [0, 1].map(crate::projects::recent);
+                let found = [0, 1].map(crate::projects::list);
                 if busy.send(Update::Projects(found)).is_err() {
                     break;
                 }
