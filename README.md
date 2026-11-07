@@ -14,7 +14,7 @@ Rust · Windows · Local first · MIT
 
 ## What Void does
 
-Click the cat to open the menu. It answers one question — what you have and what you've spent: a one-line verdict from the cat, then one line per agent with how much of the tighter limit is left ("74%"), which limit and when it resets, and the tokens spent in the current five-hour and weekly windows ("Витрачено 282 тис. за 5 год · 1,8 млн за тиждень"). Subscriptions report quota as percentages; token counts come from the agents' local transcripts (fresh input, cache writes and output). Claude chat on the web or phone shares the quota but isn't in those transcripts. The menu closes after 30 seconds without the pointer on it or the cat, and at once when you click another window. The gear opens settings.
+Click the cat to open the menu. It answers one question: can I use each agent right now, and what is left? At the top, one line built from the same data as the rows below it. Each agent has a status (Ready to work, Running low, Paused until 19:28, or why there is no data) and its two limits side by side, the five-hour window and the weekly one: how much is left, a bar, when it resets, and how many tokens were spent in that window. Subscriptions report quota as percentages; token counts come from the agents' local transcripts (fresh input, cache writes and output). Claude chat on the web or phone shares the quota but is not in those transcripts. The menu closes after 30 seconds without the pointer on it or the cat, and at once when you click another window. The gear opens settings.
 
 - Separate five-hour and weekly limits for each provider.
 - Time and typical prompts remaining, based on observed consumption.

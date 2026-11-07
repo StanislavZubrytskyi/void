@@ -167,7 +167,6 @@ pub type SelectLimit = fn(&Limits) -> Option<Limit>;
 
 pub struct Forecast {
     pub limit: Limit,
-    pub typical_prompts: Option<f64>,
     pub minutes: Option<f64>,
 }
 
@@ -235,14 +234,14 @@ pub fn forecast(history: &[Record], select: SelectLimit, time: u64) -> Option<Fo
         .filter(|(before, after)| before.sample.session_id == after.sample.session_id)
         .collect();
     pairs.sort_by_key(|(before, _)| before.time);
-    let mut changes = Vec::new();
     let mut pace = Vec::new();
     for &(before, after) in pairs.iter().rev() {
-        if time.saturating_sub(before.time) > 7 * 86400 || pace.len().max(changes.len()) >= 40 {
+        if time.saturating_sub(before.time) > 7 * 86400 || pace.len() >= 40 {
             break;
         }
         let elapsed = after.time.saturating_sub(before.time);
-        // Polled account snapshots carry no prompt id: they give the pace, not a per-prompt cost.
+        // Polled account snapshots carry no prompt id; a prompt's own row must pair with another
+        // prompt row (a row without an id after one with an id is a snapshot, which is skipped).
         let snapshots = before.sample.prompt_id.is_none() && after.sample.prompt_id.is_none();
         if (after.sample.prompt_id.is_none() && !snapshots) || elapsed > FRESH_SECONDS {
             continue;
@@ -255,24 +254,16 @@ pub fn forecast(history: &[Record], select: SelectLimit, time: u64) -> Option<Fo
             continue;
         }
         let delta = b.used_percentage - a.used_percentage;
-        if !snapshots {
-            changes.push(delta);
-        }
         if elapsed > 0 {
             pace.push((delta, elapsed as f64 / 60.0));
         }
     }
     let remaining = 100.0 - limit.used_percentage;
-    let typical_prompts = (changes.len() >= 5)
-        .then(|| changes.iter().sum::<f64>() / changes.len() as f64)
-        .filter(|rate| *rate > 0.0)
-        .map(|rate| (remaining / rate).floor());
     let pace = (pace.len() >= 5)
         .then(|| pace.iter().map(|p| p.0).sum::<f64>() / pace.iter().map(|p| p.1).sum::<f64>())
         .filter(|rate| *rate > 0.0);
     Some(Forecast {
         limit,
-        typical_prompts,
         minutes: if remaining == 0.0 {
             Some(0.0)
         } else {
@@ -315,7 +306,6 @@ mod tests {
             })
             .collect();
         let estimate = forecast(&rows, |r| r.five_hour, time).unwrap();
-        assert_eq!(estimate.typical_prompts, None);
         // 46 pp left at 0.25 pp/min
         assert!((estimate.minutes.unwrap() - 184.0).abs() < 0.01);
     }
@@ -344,7 +334,6 @@ mod tests {
             .collect();
         let estimate = forecast(&rows, |r| r.five_hour, time).unwrap();
         // 42 pp left at 1 pp per prompt, and 1 pp per 2 minutes in both sessions.
-        assert_eq!(estimate.typical_prompts, Some(42.0));
         assert!((estimate.minutes.unwrap() - 84.0).abs() < 0.01);
     }
 }

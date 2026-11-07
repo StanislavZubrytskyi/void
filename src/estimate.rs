@@ -488,8 +488,7 @@ mod tests {
         assert_eq!(five.resets_at, now - 3600 + FIVE_HOURS);
 
         let forecast = crate::usage::forecast(&records, |r| r.five_hour, now).unwrap();
-        // 5 pp per prompt, 2.5 pp per minute, 40 pp left.
-        assert_eq!(forecast.typical_prompts, Some(8.0));
+        // 2.5 pp per minute, 40 pp left.
         assert!((forecast.minutes.unwrap() - 16.0).abs() < 1e-6);
     }
 

@@ -540,39 +540,30 @@ impl eframe::App for Companion {
                     Vec2::new(96.0, 88.0),
                 );
                 let window = if self.details {
-                    let speech = advice::speech(
-                        [("Claude", &claude_status), ("Codex", &codex_status)],
-                        time,
-                        self.offset,
-                    );
-                    let menu = panel::menu(
-                        speech.title,
-                        speech.detail,
-                        [
-                            panel::row(
-                                0,
-                                &claude_status,
-                                claude,
-                                self.claude_failure.map(|failure| failure.label()),
-                                spent(&self.tokens[0], claude, time),
-                                time,
-                                self.offset,
-                            ),
-                            panel::row(
-                                1,
-                                &codex_status,
-                                &self.codex_records,
-                                (!self.codex_online).then_some(i18n::s(
-                                    "Немає зв’язку · повторюю підключення",
-                                    "Нет связи · переподключаюсь",
-                                    "No connection · reconnecting",
-                                )),
-                                spent(&self.tokens[1], &self.codex_records, time),
-                                time,
-                                self.offset,
-                            ),
-                        ],
-                    );
+                    let menu = panel::menu([
+                        panel::row(
+                            0,
+                            &claude_status,
+                            claude,
+                            self.claude_failure.map(|failure| failure.label()),
+                            spent(&self.tokens[0], claude, time),
+                            time,
+                            self.offset,
+                        ),
+                        panel::row(
+                            1,
+                            &codex_status,
+                            &self.codex_records,
+                            (!self.codex_online).then_some(i18n::s(
+                                "Немає зв’язку · повторюю підключення",
+                                "Нет связи · переподключаюсь",
+                                "No connection · reconnecting",
+                            )),
+                            spent(&self.tokens[1], &self.codex_records, time),
+                            time,
+                            self.offset,
+                        ),
+                    ]);
                     let window = panel::window_size(&menu);
                     if bounds.width() >= window.x - 0.5 && bounds.height() >= window.y - 0.5 {
                         let (area, action) = panel::draw(
@@ -925,7 +916,6 @@ mod tests {
         let time = 1_800_000_000;
         let rows = demo_codex_history(time);
         let estimate = usage::forecast(&rows, |r| r.five_hour, time).unwrap();
-        assert_eq!(estimate.typical_prompts, Some(12.0));
         assert!((estimate.minutes.unwrap() - 45.0).abs() < 0.01);
         assert!(usage::forecast(&rows, |r| r.five_hour, time + 1801).is_none());
         assert!(usage::forecast(&rows, |r| r.five_hour, time + 4800).is_none());
@@ -943,8 +933,6 @@ mod tests {
             used,
             blocked: None,
             risk: None,
-            lasting: None,
-            opus: false,
         }
     }
 
@@ -977,7 +965,6 @@ mod tests {
                 window: "5 год",
                 minutes: 25.0,
                 reset_at: time + 7200,
-                prompts: None,
             }),
             ..status(Tone::Warn, Some(90.0))
         };

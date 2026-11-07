@@ -141,17 +141,39 @@ pub fn quotas(records: &[Record], now: u64, offset: i64) -> Vec<Quota> {
         .collect()
 }
 
-/// One agent's line in the menu: what is left, until when, and what was spent.
-pub struct Row {
-    pub agent: usize,
-    /// "84%" of the tighter limit, or "пауза".
-    pub big: String,
-    pub paused: bool,
-    /// "лишилось · 5 год ↻ о 23:50" or "повернеться о 19:28".
-    pub under: String,
-    /// "Витрачено 1,2 млн за 5 год · 9,8 млн за тиждень".
+/// Whether an agent can be used right now.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Verdict {
+    Ready,
+    Low,
+    Paused,
+    Unknown,
+}
+
+/// One of an agent's limits: what is left, when it resets, and what was spent in it.
+pub struct Window {
+    pub label: &'static str,
+    /// 0..1 of the limit that is left; None when there is no fresh measurement.
+    pub left: Option<f32>,
+    /// "↻ о 23:49", or why there is nothing to show.
+    pub reset: String,
+    /// "витрачено 1,6 млн".
     pub spent: Option<String>,
 }
+
+/// One agent in the menu: can it be used, and where each limit stands.
+pub struct Row {
+    pub agent: usize,
+    pub verdict: Verdict,
+    /// "Можна працювати", "Мало", "Пауза до 19:28", or the reason there is no data.
+    pub status: String,
+    /// When a paused agent comes back, without a preposition ("19:28").
+    pub until: Option<String>,
+    pub windows: [Window; 2],
+}
+
+/// Below this share left, an agent is "running low".
+const LOW: f32 = 0.15;
 
 /// "1,2 млн", "640 тис." or "950" — a count that fits a short line.
 pub fn short_tokens(tokens: u64) -> String {
@@ -181,67 +203,214 @@ pub fn row(
     now: u64,
     offset: i64,
 ) -> Row {
-    let windows = quotas(records, now, offset);
-    let tighter = windows
+    let quotas = quotas(records, now, offset);
+    let windows = std::array::from_fn(|i| {
+        let quota = quotas.get(i);
+        Window {
+            label: quota.map_or("", |quota| quota.name),
+            left: quota.and_then(|quota| quota.remaining),
+            reset: quota.map_or_else(String::new, |quota| quota.reset.clone()),
+            spent: spent[i].map(|tokens| {
+                let amount = short_tokens(tokens);
+                t!("витрачено {amount}", "потрачено {amount}", "spent {amount}")
+            }),
+        }
+    });
+    let known = windows.iter().any(|window| window.left.is_some());
+    let low = windows
         .iter()
-        .filter(|quota| quota.remaining.is_some())
-        .min_by(|a, b| {
-            a.remaining
-                .partial_cmp(&b.remaining)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    let (big, paused, under) = if let Some((_, reset)) = status.blocked {
-        let back = advice::clock(reset, now, offset);
+        .filter_map(|window| window.left)
+        .any(|left| left <= LOW);
+    let (verdict, status, until) = if let Some((_, reset)) = status.blocked {
+        let at = advice::until(reset, now, offset);
         (
-            s("пауза", "пауза", "paused").to_owned(),
-            true,
-            t!("повернеться {back}", "вернётся {back}", "back {back}"),
+            Verdict::Paused,
+            t!("Пауза до {at}", "Пауза до {at}", "Paused until {at}"),
+            Some(at),
         )
-    } else if let Some(quota) = tighter {
-        let left = quota.remaining.unwrap_or(0.0) * 100.0;
-        let (window, reset) = (quota.name, &quota.reset);
+    } else if !known {
         (
-            format!("{left:.0}%"),
-            false,
-            t!(
-                "лишилось · {window} {reset}",
-                "осталось · {window} {reset}",
-                "left · {window} {reset}"
-            ),
+            Verdict::Unknown,
+            unavailable
+                .unwrap_or(s("Немає даних", "Нет данных", "No data"))
+                .to_owned(),
+            None,
+        )
+    } else if low {
+        (
+            Verdict::Low,
+            s("Мало", "Мало", "Running low").to_owned(),
+            None,
         )
     } else {
         (
-            "—".to_owned(),
-            false,
-            unavailable
-                .unwrap_or(s("немає даних", "нет данных", "no data"))
-                .to_owned(),
+            Verdict::Ready,
+            s("Можна працювати", "Можно работать", "Ready to work").to_owned(),
+            None,
         )
-    };
-    let spent = match spent {
-        [Some(five), Some(week)] if week > 0 => {
-            let (five, week) = (short_tokens(five), short_tokens(week));
-            Some(t!(
-                "Витрачено {five} за 5 год · {week} за тиждень",
-                "Потрачено {five} за 5 ч · {week} за неделю",
-                "Spent {five} in 5 h · {week} this week"
-            ))
-        }
-        _ => None,
     };
     Row {
         agent,
-        big,
-        paused,
-        under,
-        spent,
+        verdict,
+        status,
+        until,
+        windows,
+    }
+}
+
+/// The one-line answer at the top, built from the same rows so it never disagrees with them.
+fn summary(rows: &[Row; 2]) -> (String, String) {
+    let name = |row: &Row| ["Claude", "Codex"][row.agent];
+    let room = |row: &Row| {
+        row.windows
+            .iter()
+            .filter_map(|window| window.left)
+            .fold(f32::INFINITY, f32::min)
+    };
+    let (a, b) = (&rows[0], &rows[1]);
+    // What to say about the other agent when this one is the subject.
+    let about = |other: &Row| match other.verdict {
+        Verdict::Ready => {
+            let n = name(other);
+            t!("Працюй у {n}", "Работай в {n}", "Work in {n}")
+        }
+        Verdict::Low => {
+            let n = name(other);
+            t!(
+                "{n}: лишилось мало",
+                "{n}: осталось мало",
+                "{n}: running low"
+            )
+        }
+        _ => {
+            let n = name(other);
+            t!("{n}: немає даних", "{n}: нет данных", "{n}: no data")
+        }
+    };
+    match (a.verdict, b.verdict) {
+        (Verdict::Paused, Verdict::Paused) => (
+            s("Обидва на паузі", "Оба на паузе", "Both are paused").to_owned(),
+            t!(
+                "Claude до {} · Codex до {}",
+                "Claude до {} · Codex до {}",
+                "Claude until {} · Codex until {}",
+                a.until.clone().unwrap_or_default(),
+                b.until.clone().unwrap_or_default()
+            ),
+        ),
+        (Verdict::Paused, _) | (_, Verdict::Paused) => {
+            let (paused, other) = if a.verdict == Verdict::Paused {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let (n, at) = (name(paused), paused.until.clone().unwrap_or_default());
+            (
+                t!(
+                    "{n} на паузі до {at}",
+                    "{n} на паузе до {at}",
+                    "{n} paused until {at}"
+                ),
+                about(other),
+            )
+        }
+        (Verdict::Low, Verdict::Low) => (
+            s(
+                "Обидва майже вичерпано",
+                "Оба почти исчерпаны",
+                "Both are almost out",
+            )
+            .to_owned(),
+            String::new(),
+        ),
+        (Verdict::Low, _) | (_, Verdict::Low) => {
+            let (low, other) = if a.verdict == Verdict::Low {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let n = name(low);
+            (
+                t!(
+                    "У {n} лишилось мало",
+                    "У {n} осталось мало",
+                    "{n} is running low"
+                ),
+                about(other),
+            )
+        }
+        (Verdict::Ready, Verdict::Ready) => {
+            let detail = if (room(a) - room(b)).abs() >= 0.15 {
+                let n = name(if room(a) > room(b) { a } else { b });
+                t!(
+                    "Більше запасу в {n}",
+                    "Больше запаса в {n}",
+                    "More room in {n}"
+                )
+            } else {
+                String::new()
+            };
+            (
+                s(
+                    "Обидва готові до роботи",
+                    "Оба готовы к работе",
+                    "Both are ready to work",
+                )
+                .to_owned(),
+                detail,
+            )
+        }
+        (Verdict::Ready, Verdict::Unknown) | (Verdict::Unknown, Verdict::Ready) => {
+            let (ready, other) = if a.verdict == Verdict::Ready {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let n = name(ready);
+            (
+                t!(
+                    "{n} готовий до роботи",
+                    "{n} готов к работе",
+                    "{n} is ready to work"
+                ),
+                about(other),
+            )
+        }
+        (Verdict::Unknown, Verdict::Unknown) => (
+            s(
+                "Поки нічого не бачу",
+                "Пока ничего не вижу",
+                "Nothing to see yet",
+            )
+            .to_owned(),
+            s(
+                "Попрацюй у Claude Code чи Codex",
+                "Поработай в Claude Code или Codex",
+                "Work in Claude Code or Codex",
+            )
+            .to_owned(),
+        ),
     }
 }
 
 const HEADER: f32 = 62.0;
-const ROW_HEIGHT: f32 = 72.0;
+const ROW_HEIGHT: f32 = 124.0;
 
-/// The menu: one verdict, one line per agent, and settings behind the gear.
+/// Soft status colors, kept out of the monochrome surface so a status reads at a glance.
+const READY: Color32 = Color32::from_rgb(126, 200, 150);
+const WARN: Color32 = Color32::from_rgb(240, 184, 92);
+const STOP: Color32 = Color32::from_rgb(236, 112, 102);
+
+fn verdict_color(verdict: Verdict) -> Color32 {
+    match verdict {
+        Verdict::Ready => READY,
+        Verdict::Low => WARN,
+        Verdict::Paused => STOP,
+        Verdict::Unknown => GRAY,
+    }
+}
+
+/// The menu: one answer at the top, each agent below it, and settings behind the gear.
 pub struct Menu {
     pub title: String,
     pub detail: String,
@@ -249,7 +418,8 @@ pub struct Menu {
     pub size: Vec2,
 }
 
-pub fn menu(title: String, detail: String, rows: [Row; 2]) -> Menu {
+pub fn menu(rows: [Row; 2]) -> Menu {
+    let (title, detail) = summary(&rows);
     Menu {
         title,
         detail,
@@ -397,36 +567,69 @@ pub fn draw(
                 Stroke::new(1.0, Color32::from_white_alpha(18)),
             );
             let color = tint(row.agent);
-            painter.circle_filled(Pos2::new(left + 4.0, y + 21.0), 4.0, color);
+            let status_color = verdict_color(row.verdict);
+            painter.circle_filled(Pos2::new(left + 4.0, y + 20.0), 4.0, color);
             painter.text(
-                Pos2::new(left + 16.0, y + 12.0),
+                Pos2::new(left + 16.0, y + 11.0),
                 egui::Align2::LEFT_TOP,
                 ["Claude", "Codex"][row.agent],
-                strong(13.5),
+                strong(14.0),
                 LABEL,
             );
             painter.text(
-                Pos2::new(right, y + 8.0),
+                Pos2::new(right, y + 13.0),
                 egui::Align2::RIGHT_TOP,
-                &row.big,
-                strong(if row.paused { 17.0 } else { 24.0 }),
-                if row.paused { SECONDARY } else { LABEL },
+                &row.status,
+                strong(11.5),
+                status_color,
             );
-            painter.text(
-                Pos2::new(left + 16.0, y + 31.0),
-                egui::Align2::LEFT_TOP,
-                &row.under,
-                regular(11.0),
-                SECONDARY,
-            );
-            if let Some(spent) = &row.spent {
+            // The two limits side by side: what is left, a bar, when it resets, what was spent.
+            let gap = 16.0;
+            let column = (right - left - gap) / 2.0;
+            for (j, window) in row.windows.iter().enumerate() {
+                let x = left + j as f32 * (column + gap);
                 painter.text(
-                    Pos2::new(left + 16.0, y + 48.0),
+                    Pos2::new(x, y + 38.0),
                     egui::Align2::LEFT_TOP,
-                    spent,
-                    regular(11.0),
-                    color.gamma_multiply(0.9),
+                    window.label,
+                    regular(10.5),
+                    SECONDARY,
                 );
+                let (big, big_color) = match window.left {
+                    Some(left) => (format!("{:.0}%", left * 100.0), LABEL),
+                    None => ("—".to_owned(), GRAY),
+                };
+                painter.text(
+                    Pos2::new(x, y + 51.0),
+                    egui::Align2::LEFT_TOP,
+                    big,
+                    strong(22.0),
+                    big_color,
+                );
+                let track = Rect::from_min_size(Pos2::new(x, y + 82.0), Vec2::new(column, 4.0));
+                painter.rect_filled(track, 2.0, Color32::from_white_alpha(25));
+                if let Some(share) = window.left.filter(|share| *share > 0.0) {
+                    let fill =
+                        Rect::from_min_size(track.min, Vec2::new(track.width() * share, 4.0));
+                    let bar = if share <= LOW { WARN } else { color };
+                    painter.rect_filled(fill, 2.0, bar);
+                }
+                painter.text(
+                    Pos2::new(x, y + 91.0),
+                    egui::Align2::LEFT_TOP,
+                    &window.reset,
+                    regular(10.0),
+                    SECONDARY,
+                );
+                if let Some(spent) = &window.spent {
+                    painter.text(
+                        Pos2::new(x, y + 105.0),
+                        egui::Align2::LEFT_TOP,
+                        spent,
+                        regular(10.0),
+                        color.gamma_multiply(0.9),
+                    );
+                }
             }
         }
         None
@@ -964,31 +1167,59 @@ mod tests {
             ["5 год", "7 днів"]
         );
     }
+    fn limits(five: f64, week: f64, now: u64) -> Vec<Record> {
+        vec![
+            serde_json::from_value(serde_json::json!({
+                "time": now, "session_id": "s",
+                "rate_limits": {
+                    "five_hour": { "used_percentage": five, "resets_at": now + 3600 },
+                    "seven_day": { "used_percentage": week, "resets_at": now + 86_400 }
+                }
+            }))
+            .unwrap(),
+        ]
+    }
+
     #[test]
-    fn menu_rows_lead_with_what_is_left_and_what_was_spent() {
+    fn menu_rows_say_whether_an_agent_can_be_used_and_where_each_limit_stands() {
         let now = 1_800_000_000;
-        let codex = crate::demo_codex_history(now);
-        let row = row(
+        let ready = limits(40.0, 26.0, now);
+        let ready = row(
             1,
-            &advice::assess(&codex, now),
-            &codex,
+            &advice::assess(&ready, now),
+            &ready,
             None,
             [Some(1_250_000), Some(9_800_000)],
             now,
             0,
         );
-        assert_eq!(row.big, "24%");
-        assert!(
-            row.under.starts_with("лишилось · 5 год ↻ "),
-            "{}",
-            row.under
+        assert_eq!(ready.verdict, Verdict::Ready);
+        assert_eq!(ready.status, "Можна працювати");
+        assert_eq!(
+            ready.windows[0].left.map(|l| (l * 100.0).round()),
+            Some(60.0)
         );
         assert_eq!(
-            row.spent.as_deref(),
-            Some("Витрачено 1,2 млн за 5 год · 9,8 млн за тиждень")
+            ready.windows[1].left.map(|l| (l * 100.0).round()),
+            Some(74.0)
         );
+        assert_eq!(ready.windows[0].spent.as_deref(), Some("витрачено 1,2 млн"));
+        assert_eq!(ready.windows[1].spent.as_deref(), Some("витрачено 9,8 млн"));
+
+        let low = limits(92.0, 30.0, now);
+        let low = row(
+            0,
+            &advice::assess(&low, now),
+            &low,
+            None,
+            [None, None],
+            now,
+            0,
+        );
+        assert_eq!((low.verdict, low.status.as_str()), (Verdict::Low, "Мало"));
+
         let claude = vec![crate::demo_claude_snapshot(now)];
-        let paused = super::row(
+        let paused = row(
             0,
             &advice::assess(&claude, now),
             &claude,
@@ -997,24 +1228,53 @@ mod tests {
             now,
             0,
         );
-        assert!(paused.paused);
-        assert!(paused.under.starts_with("повернеться "), "{}", paused.under);
-        assert_eq!(paused.spent, None);
-        let expired = now + 86_401;
-        let unknown = super::row(
+        assert_eq!(paused.verdict, Verdict::Paused);
+        assert!(paused.status.starts_with("Пауза до "), "{}", paused.status);
+        assert!(paused.until.is_some());
+
+        let none: Vec<Record> = Vec::new();
+        let unknown = row(
             1,
-            &advice::assess(&codex, expired),
-            &codex,
+            &advice::assess(&none, now),
+            &none,
             Some("Немає зв’язку"),
             [None, None],
-            expired,
+            now,
             0,
         );
         assert_eq!(
-            (unknown.big.as_str(), unknown.under.as_str()),
-            ("—", "Немає зв’язку")
+            (unknown.verdict, unknown.status.as_str()),
+            (Verdict::Unknown, "Немає зв’язку")
         );
         assert_eq!(short_tokens(640_400), "640 тис.");
         assert_eq!(short_tokens(950), "950");
+
+        // The header agrees with the rows.
+        let (title, detail) = summary(&[paused, ready]);
+        assert!(title.starts_with("Claude на паузі до "), "{title}");
+        assert_eq!(detail, "Працюй у Codex");
+        let both = [
+            row(
+                0,
+                &advice::assess(&limits(10.0, 10.0, now), now),
+                &limits(10.0, 10.0, now),
+                None,
+                [None, None],
+                now,
+                0,
+            ),
+            row(
+                1,
+                &advice::assess(&limits(80.0, 10.0, now), now),
+                &limits(80.0, 10.0, now),
+                None,
+                [None, None],
+                now,
+                0,
+            ),
+        ];
+        let (title, detail) = summary(&both);
+        assert_eq!(title, "Обидва готові до роботи");
+        assert_eq!(detail, "Більше запасу в Claude");
     }
 }
