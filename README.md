@@ -24,7 +24,7 @@ Click the cat to open the menu. It answers one question — what you have and wh
 - Windows system tray, optional startup and notifications; no taskbar button.
 - Explicit missing and stale data. Unknown values stay unknown.
 - A thought bubble above the cat while Claude Code or Codex is working. Hover it for each running turn: project, elapsed time, your prompt, the current tool, tokens spent so far (fresh input, cache writes and output; cache reads excluded), both quota limits, and — once there is history — a forecast from your own past turns with similar prompts ("схожі: ще ≈ 6 хв · ≈ 4% квоти").
-- A cat's meow when an agent finishes a turn: a long, drawn-out one for Claude, a short bright one for Codex. Synthesized locally, no sound files.
+- A cat's sound when an agent finishes a turn: three soft meows and a small bell that settles the moment. Claude hears the calmer set, Codex a brighter kitten. Synthesized locally, no sound files.
 - Settings behind the gear in the panel: interface language (Українська, Русский, English) and the finish sound, saved in `~/.void/settings.json`.
 - Advice on where the next task should go, from how many typical turns each agent's five-hour quota still holds.
 

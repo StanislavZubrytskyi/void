@@ -1,21 +1,10 @@
-//! A cat's meow when an agent finishes a turn: a voiced source whose pitch glides up and down,
-//! shaped by two resonances so it sounds like a vowel. Claude's is a long, drawn-out "мяяу";
-//! Codex's is a short, brighter "мяу!". Synthesized once into an in-memory WAV, so nothing ships
-//! as an asset.
+//! Cat sounds for a finished turn: a few soft meows, then a small bell that settles the moment.
+//! Claude hears the calmer set, Codex the brighter kitten. Synthesized once into in-memory WAVs,
+//! so nothing ships as an asset.
 
 use std::{f32::consts::TAU, sync::OnceLock};
 
 const RATE: u32 = 22_050;
-
-/// One meow: a pitch contour through `pitch` (Hz at the start, the peak, and the end), a total
-/// length, and the two vowel resonances.
-struct Meow {
-    seconds: f32,
-    pitch: [f32; 3],
-    formants: [f32; 2],
-    /// Gain of the second formant against the first.
-    brightness: f32,
-}
 
 /// RBJ band-pass biquad, direct form I.
 struct Band {
@@ -47,51 +36,100 @@ impl Band {
     }
 }
 
-fn render(meow: &Meow) -> Vec<f32> {
-    let total = (RATE as f32 * meow.seconds) as usize;
-    let mut first = Band::new(meow.formants[0], 7.0);
-    let mut second = Band::new(meow.formants[1], 9.0);
+fn ease(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// One meow: a voice whose pitch rises and then falls like "мяу", shaped by two vowel
+/// resonances, with a breath of noise and a gentle low-pass so nothing sits in the harsh top end.
+fn meow(seconds: f32, pitch: [f32; 3], formants: [f32; 2], gain: f32, seed: &mut u32) -> Vec<f32> {
+    let total = (RATE as f32 * seconds) as usize;
+    let mut first = Band::new(formants[0], 4.0);
+    let mut second = Band::new(formants[1], 6.0);
+    let mut low = 0.0_f32;
+    let smoothing = 1.0 - (-TAU * 3000.0 / RATE as f32).exp();
     let mut phase = 0.0_f32;
     let mut out = Vec::with_capacity(total);
     for i in 0..total {
         let t = i as f32 / total as f32;
-        // Pitch glides through the three points: up to the peak, then down to the end.
-        let contour = if t < 0.4 {
-            meow.pitch[0] + (meow.pitch[1] - meow.pitch[0]) * ease(t / 0.4)
+        let sec = i as f32 / RATE as f32;
+        let f = if t < 0.35 {
+            pitch[0] + (pitch[1] - pitch[0]) * ease(t / 0.35)
         } else {
-            meow.pitch[1] + (meow.pitch[2] - meow.pitch[1]) * ease((t - 0.4) / 0.6)
-        };
-        // A slow, shallow vibrato, the way a real voice wobbles.
-        let vibrato = 1.0 + 0.012 * (TAU * 5.5 * i as f32 / RATE as f32).sin();
-        phase += TAU * contour * vibrato / RATE as f32;
-        if phase > TAU {
-            phase -= TAU;
-        }
-        // A glottal-like source: harmonics falling off with frequency, which sounds like a voice.
+            pitch[1] + (pitch[2] - pitch[1]) * ease((t - 0.35) / 0.65)
+        } * (1.0 + 0.01 * (TAU * 6.0 * sec).sin());
+        phase += TAU * f / RATE as f32;
         let mut source = 0.0_f32;
-        for n in 1..=24 {
-            let harmonic = n as f32;
-            if harmonic * contour * vibrato > 6000.0 {
-                break;
-            }
-            source += (harmonic * phase).sin() / harmonic;
+        for n in 1..=7 {
+            source += (n as f32 * phase).sin() / (n as f32).powf(1.3);
         }
-        // Resonances move with the mouth: the vowel opens as the pitch peaks.
-        let open = 1.0 + 0.15 * (1.0 - (t - 0.4).abs() * 2.0).max(0.0);
-        let a = first.step(source * open);
-        let b = second.step(source) * meow.brightness;
-        let t_sec = i as f32 / RATE as f32;
-        let attack = (t_sec / 0.06).min(1.0);
-        let release = ((meow.seconds - t_sec) / 0.14).clamp(0.0, 1.0);
-        out.push((a + b) * attack * release);
+        // A small linear congruential generator: the breath is the same on every start.
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let noise = ((*seed >> 8) as f32 / (1_u32 << 24) as f32) * 2.0 - 1.0;
+        let voiced = first.step(source) * 0.7 + second.step(source) * 0.35 + noise * 0.03;
+        low += smoothing * (voiced - low);
+        let envelope = (sec / 0.05).min(1.0) * ((seconds - sec) / 0.12).clamp(0.0, 1.0);
+        out.push(low * envelope);
     }
-    let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs())).max(1e-6);
-    out.iter().map(|s| s / peak * 0.6).collect()
+    normalize(&mut out, gain);
+    out
 }
 
-fn ease(x: f32) -> f32 {
-    let x = x.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
+/// A soft, round bell: a sine with a quick attack and a long, warm tail. Each note is
+/// (start in seconds, frequency, level).
+fn bell(seconds: f32, notes: &[(f32, f32, f32)], gain: f32) -> Vec<f32> {
+    let total = (RATE as f32 * seconds) as usize;
+    let mut out = vec![0.0_f32; total];
+    for &(start, frequency, level) in notes {
+        let first = (start * RATE as f32) as usize;
+        for (i, sample) in out[first.min(total)..].iter_mut().enumerate() {
+            let t = i as f32 / RATE as f32;
+            let envelope = (t / 0.01).min(1.0) * (-t * 3.2).exp();
+            *sample += level
+                * envelope
+                * ((TAU * frequency * t).sin() + 0.12 * (TAU * 2.0 * frequency * t).sin());
+        }
+    }
+    normalize(&mut out, gain);
+    out
+}
+
+fn normalize(samples: &mut [f32], gain: f32) {
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |m, s| m.max(s.abs()))
+        .max(1e-6);
+    for sample in samples.iter_mut() {
+        *sample = *sample / peak * gain;
+    }
+}
+
+/// Parts played one after another, each followed by its own silence.
+fn sequence(parts: &[(Vec<f32>, f32)]) -> Vec<f32> {
+    let mut out = Vec::new();
+    for (part, gap) in parts {
+        out.extend_from_slice(part);
+        out.extend(std::iter::repeat_n(0.0, (RATE as f32 * gap) as usize));
+    }
+    out
+}
+
+/// `b` starts `offset` seconds into `a`; the result is long enough for both.
+fn mix(a: &[f32], b: &[f32], offset: f32) -> Vec<f32> {
+    let shift = (RATE as f32 * offset) as usize;
+    let len = a.len().max(b.len() + shift);
+    (0..len)
+        .map(|i| {
+            let first = a.get(i).copied().unwrap_or(0.0);
+            let second = if i >= shift {
+                b.get(i - shift).copied().unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            first + second
+        })
+        .collect()
 }
 
 fn wav(samples: &[f32]) -> Vec<u8> {
@@ -116,29 +154,70 @@ fn wav(samples: &[f32]) -> Vec<u8> {
     wav
 }
 
-/// The meow for agent 0 (Claude) or 1 (Codex); kept alive for the asynchronous player.
+/// Claude's: three soft meows, the last one longer, and a bell that settles the moment.
+fn calm() -> Vec<f32> {
+    let mut seed = 7_u32;
+    let meows = sequence(&[
+        (
+            meow(0.3, [440.0, 640.0, 380.0], [820.0, 1900.0], 0.16, &mut seed),
+            0.07,
+        ),
+        (
+            meow(0.3, [460.0, 680.0, 400.0], [820.0, 1900.0], 0.16, &mut seed),
+            0.07,
+        ),
+        (
+            meow(
+                0.55,
+                [470.0, 720.0, 360.0],
+                [780.0, 1800.0],
+                0.18,
+                &mut seed,
+            ),
+            0.0,
+        ),
+    ]);
+    let landing = bell(0.9, &[(0.0, 1046.5, 0.45), (0.14, 1318.5, 0.35)], 0.16);
+    mix(&meows, &landing, 0.62)
+}
+
+/// Codex's: the same idea, a little higher and quicker, like a kitten.
+fn kitten() -> Vec<f32> {
+    let mut seed = 7_u32;
+    let meows = sequence(&[
+        (
+            meow(
+                0.22,
+                [620.0, 860.0, 520.0],
+                [950.0, 2200.0],
+                0.15,
+                &mut seed,
+            ),
+            0.05,
+        ),
+        (
+            meow(
+                0.22,
+                [640.0, 880.0, 540.0],
+                [950.0, 2200.0],
+                0.15,
+                &mut seed,
+            ),
+            0.05,
+        ),
+        (
+            meow(0.4, [660.0, 920.0, 480.0], [900.0, 2100.0], 0.17, &mut seed),
+            0.0,
+        ),
+    ]);
+    let landing = bell(0.9, &[(0.0, 1046.5, 0.45), (0.14, 1318.5, 0.35)], 0.16);
+    mix(&meows, &landing, 0.45)
+}
+
+/// The sound for agent 0 (Claude) or 1 (Codex); kept alive for the asynchronous player.
 fn chime(agent: usize) -> &'static [u8] {
-    static MEOWS: [OnceLock<Vec<u8>>; 2] = [OnceLock::new(), OnceLock::new()];
-    MEOWS[agent.min(1)].get_or_init(|| {
-        let meow = if agent == 0 {
-            // A long, sleepy "мяяяу": low start, a rising question, a soft fall.
-            Meow {
-                seconds: 1.05,
-                pitch: [520.0, 780.0, 430.0],
-                formants: [820.0, 1900.0],
-                brightness: 0.45,
-            }
-        } else {
-            // A short, bright "мяу!": quick and high, like a happy hello.
-            Meow {
-                seconds: 0.52,
-                pitch: [760.0, 1010.0, 640.0],
-                formants: [1000.0, 2400.0],
-                brightness: 0.6,
-            }
-        };
-        wav(&render(&meow))
-    })
+    static SOUNDS: [OnceLock<Vec<u8>>; 2] = [OnceLock::new(), OnceLock::new()];
+    SOUNDS[agent.min(1)].get_or_init(|| wav(&if agent == 0 { calm() } else { kitten() }))
 }
 
 pub fn play(agent: usize) {
@@ -162,21 +241,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn meows_are_valid_short_wavs_that_differ() {
+    fn sounds_are_valid_short_wavs_that_differ() {
         let (claude, codex) = (chime(0), chime(1));
         for wav in [claude, codex] {
             assert_eq!(&wav[..4], b"RIFF");
             assert_eq!(&wav[8..16], b"WAVEfmt ");
             let length = u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize;
             assert_eq!(length + 44, wav.len());
-            assert!(length / 2 <= RATE as usize * 3 / 2); // under a second and a half
-            // The meow is audible: not silence, and not clipped to a square wave.
+            assert!(length / 2 <= RATE as usize * 2); // under two seconds
+            // Audible, and not clipped: a soft level.
             let samples: Vec<i16> = wav[44..]
                 .chunks_exact(2)
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-            assert!((4000..=i16::MAX as u16).contains(&peak), "peak {peak}");
+            assert!((2000..=i16::MAX as u16).contains(&peak), "peak {peak}");
         }
         assert_ne!(claude, codex);
     }
