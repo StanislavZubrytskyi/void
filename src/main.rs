@@ -524,6 +524,8 @@ impl eframe::App for Companion {
             let _ = messages; // shortcut: notifications are Windows-only until the macOS and Linux builds ship.
         }
         let asleep = asleep([&claude_status, &codex_status]);
+        // Awake while an agent works, or while someone is looking at it; asleep when nothing runs.
+        let working = self.busy.sessions.iter().any(|list| !list.is_empty());
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -659,8 +661,11 @@ impl eframe::App for Companion {
                     ctx.send_viewport_cmd(ViewportCommand::InnerSize(window));
                 }
                 // The cat sleeps only while every agent with data is blocked.
-                self.pet
-                    .draw(ui, cat_rect, !asleep || self.details || cat.hovered());
+                self.pet.draw(
+                    ui,
+                    cat_rect,
+                    cat_awake(asleep, working, self.details, cat.hovered()),
+                );
             });
         // An open menu nobody looks at closes itself: only the pointer resting on the menu or
         // the cat keeps it open. A click in another window closes it at once.
@@ -719,7 +724,12 @@ fn spent(minutes: &[(u64, u64)], records: &[Record], now: u64) -> [Option<u64>; 
 /// The open panel closes after this long without the pointer on it.
 const PANEL_IDLE_SECONDS: f64 = 30.0;
 
-/// The closed cat sleeps only while every agent with data is blocked.
+/// The cat wakes for work or attention, and sleeps when every agent is blocked or nothing runs.
+fn cat_awake(blocked: bool, working: bool, details: bool, hovered: bool) -> bool {
+    details || hovered || (working && !blocked)
+}
+
+/// Every agent with data is blocked: nothing can run, so the cat rests.
 fn asleep(agents: [&Status; 2]) -> bool {
     let known: Vec<_> = agents.iter().filter(|s| s.used.is_some()).collect();
     !known.is_empty() && known.iter().all(|s| s.tone == Tone::Blocked)
@@ -939,6 +949,12 @@ mod tests {
         let free = status(Tone::Calm, Some(10.0));
         assert!(!asleep([&blocked, &free]));
         assert!(!asleep([&unknown, &unknown]));
+        // Idle with quota left: asleep. Work, a hover or the open menu wake it.
+        assert!(!cat_awake(false, false, false, false));
+        assert!(cat_awake(false, true, false, false));
+        assert!(cat_awake(false, false, true, false));
+        assert!(cat_awake(false, false, false, true));
+        assert!(!cat_awake(true, true, false, false));
     }
 
     #[test]
