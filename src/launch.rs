@@ -14,6 +14,7 @@ pub enum Failure {
     TooLong,
     NoProject,
     NoApp,
+    NoSession,
 }
 
 /// The desktop app each agent runs in.
@@ -40,6 +41,12 @@ impl Failure {
                 "Папку проєкту не знайдено",
                 "Папка проекта не найдена",
                 "Project folder not found",
+            )
+            .into(),
+            Self::NoSession => s(
+                "Сесію не знайдено",
+                "Сессия не найдена",
+                "Session not found",
             )
             .into(),
             Self::NoApp => t!(
@@ -87,6 +94,29 @@ fn link(agent: usize, project: &Path, prompt: &str) -> String {
     } else {
         format!("codex://threads/new?prompt={text}&path={folder}")
     }
+}
+
+/// The app link that opens an existing Claude session or Codex thread. None for an id that
+/// is not the shape the app itself uses.
+fn session_link(agent: usize, id: &str) -> Option<String> {
+    let body = if agent == 0 {
+        id.strip_prefix("local_")?
+    } else {
+        id
+    };
+    if body.is_empty() || !body.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    Some(if agent == 0 {
+        format!("claude://code/continue?session={id}")
+    } else {
+        format!("codex://threads/{id}")
+    })
+}
+
+/// Opens an existing conversation in its app. The apps' links take no text for it.
+pub fn open_session(agent: usize, id: &str) -> Result<(), Failure> {
+    open(&session_link(agent, id).ok_or(Failure::NoSession)?)
 }
 
 /// Opens a new task for agent 0 (Claude) or 1 (Codex) in its desktop app.
@@ -154,6 +184,20 @@ mod tests {
             check(&here, "  fix the login \n"),
             Ok("fix the login".to_owned())
         );
+    }
+
+    #[test]
+    fn session_links_accept_only_the_apps_own_ids() {
+        assert_eq!(
+            session_link(0, "local_0a81-e30a").as_deref(),
+            Some("claude://code/continue?session=local_0a81-e30a")
+        );
+        assert_eq!(
+            session_link(1, "01a1b232-f6cb").as_deref(),
+            Some("codex://threads/01a1b232-f6cb")
+        );
+        assert_eq!(session_link(0, "01a1b232"), None);
+        assert_eq!(session_link(1, "x&y=1"), None);
     }
 
     #[test]

@@ -14,6 +14,33 @@ pub struct Project {
     pub preferred: bool,
     /// The model the app starts new sessions with here, when it says ("Opus 5.5").
     pub model: Option<String>,
+    /// The app's sessions (Claude) or threads (Codex) in this project, newest first.
+    pub sessions: Vec<Thread>,
+}
+
+/// One existing conversation in a project, to continue it in its app.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Thread {
+    /// The app's own id: `local_…` for Claude Desktop, a UUID for Codex.
+    pub id: String,
+    pub title: String,
+    /// Last activity, in Unix seconds.
+    pub last: u64,
+    pub model: Option<String>,
+}
+
+/// The most recent conversations per project worth listing.
+const THREADS: usize = 30;
+
+/// Paths compare the way Windows does: case and trailing separators don't matter.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let norm = |path: &Path| {
+        path.to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .replace('/', "\\")
+            .to_lowercase()
+    };
+    norm(a) == norm(b)
 }
 
 /// Projects of agent 0 (Claude Desktop) or 1 (Codex), as the app lists them.
@@ -102,7 +129,75 @@ fn claude() -> Vec<Project> {
             }
         }
     }
-    best.map(|(_, projects)| projects).unwrap_or_default()
+    let mut projects = best.map(|(_, projects)| projects).unwrap_or_default();
+    let sessions = claude_sessions();
+    for project in &mut projects {
+        project.sessions = sessions
+            .iter()
+            .filter(|(folder, _)| same_path(folder, &project.path))
+            .map(|(_, thread)| thread.clone())
+            .take(THREADS)
+            .collect();
+    }
+    projects
+}
+
+/// Claude Desktop's Claude Code sessions, newest first, each with the folder it runs in.
+/// Archived ones are left out, as the app hides them.
+fn claude_sessions() -> Vec<(PathBuf, Thread)> {
+    let mut found = Vec::new();
+    for dir in claude_data_dirs() {
+        collect_sessions(&dir.join("claude-code-sessions"), 3, &mut found);
+    }
+    found.sort_by(|a, b| b.1.last.cmp(&a.1.last));
+    found
+}
+
+fn collect_sessions(dir: &Path, depth: u8, found: &mut Vec<(PathBuf, Thread)>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() && depth > 0 {
+            collect_sessions(&path, depth - 1, found);
+        } else if path.extension().is_some_and(|ext| ext == "json")
+            && let Some(session) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            && let Some(entry) = claude_session(&session)
+        {
+            found.push(entry);
+        }
+    }
+}
+
+/// One session file: its id, title, last activity and model, and the project folder it
+/// belongs to (where it started, when it moved into a worktree).
+fn claude_session(session: &Value) -> Option<(PathBuf, Thread)> {
+    if session.get("isArchived").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let id = session.get("sessionId")?.as_str()?;
+    let folder = session
+        .get("originCwd")
+        .or_else(|| session.get("cwd"))?
+        .as_str()?;
+    let title = session
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_default();
+    Some((
+        PathBuf::from(folder),
+        Thread {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            last: session
+                .get("lastActivityAt")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                / 1000,
+            model: session.get("model").and_then(Value::as_str).map(model_name),
+        },
+    ))
 }
 
 /// One account's environments, sorted by name as the sidebar shows them; the last used one
@@ -148,6 +243,7 @@ fn claude_presets(account: &Value) -> (u64, Vec<Project>) {
                 .and_then(Value::as_str)
                 .map(model_name),
             preferred: false,
+            sessions: Vec::new(),
             path,
         });
     }
@@ -166,15 +262,71 @@ fn codex() -> Vec<Project> {
                 .or_else(|| std::env::var_os("HOME"))
                 .map(|home| PathBuf::from(home).join(".codex"))
         });
-    home.and_then(|home| std::fs::read(home.join(".codex-global-state.json")).ok())
+    home.as_ref()
+        .and_then(|home| std::fs::read(home.join(".codex-global-state.json")).ok())
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .map(|state| codex_projects(&state))
+        .map(|state| {
+            let titles = home.as_deref().map(codex_titles).unwrap_or_default();
+            codex_projects(&state, &titles)
+        })
         .unwrap_or_default()
+}
+
+/// Thread titles and last update from Codex's session index; later lines win.
+fn codex_titles(home: &Path) -> std::collections::HashMap<String, (String, u64)> {
+    let mut titles = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(home.join("session_index.jsonl")) else {
+        return titles;
+    };
+    for line in text.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let (Some(id), Some(name)) = (
+            entry.get("id").and_then(Value::as_str),
+            entry.get("thread_name").and_then(Value::as_str),
+        ) {
+            let updated = entry
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .and_then(crate::codex::epoch)
+                .unwrap_or(0);
+            titles.insert(id.to_owned(), (name.to_owned(), updated));
+        }
+    }
+    titles
 }
 
 /// The Codex sidebar: projects in `project-order`, then the rest by creation; the selected
 /// project is preferred.
-fn codex_projects(state: &Value) -> Vec<Project> {
+fn codex_projects(
+    state: &Value,
+    titles: &std::collections::HashMap<String, (String, u64)>,
+) -> Vec<Project> {
+    // The threads the app files under a project, newest first.
+    let threads = |project: &str| {
+        let mut list: Vec<Thread> = state
+            .get("thread-project-assignments")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(_, assigned)| {
+                assigned.get("projectId").and_then(Value::as_str) == Some(project)
+            })
+            .filter_map(|(id, _)| {
+                let (title, last) = titles.get(id)?;
+                Some(Thread {
+                    id: id.clone(),
+                    title: title.clone(),
+                    last: *last,
+                    model: None,
+                })
+            })
+            .collect();
+        list.sort_by(|a, b| b.last.cmp(&a.last));
+        list.truncate(THREADS);
+        list
+    };
     let Some(projects) = state.get("local-projects").and_then(Value::as_object) else {
         return Vec::new();
     };
@@ -214,6 +366,7 @@ fn codex_projects(state: &Value) -> Vec<Project> {
                     name,
                     preferred: selected == Some(id.as_str()),
                     model: None,
+                    sessions: threads(id),
                     path,
                 },
             ))
@@ -265,10 +418,37 @@ mod tests {
             "project-order": ["b"],
             "selected-project": { "projectId": "a" }
         });
-        let projects = codex_projects(&state);
+        let titles =
+            std::collections::HashMap::from([("t1".to_owned(), ("Fix the login".to_owned(), 10))]);
+        let mut state = state;
+        state["thread-project-assignments"] = serde_json::json!({
+            "t1": { "projectKind": "local", "projectId": "a" },
+            "t2": { "projectKind": "local", "projectId": "a" }
+        });
+        let projects = codex_projects(&state, &titles);
         let names: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["Beta", "Alpha"]);
         assert!(projects[1].preferred);
+        // Only threads the app filed under the project and that have a title.
+        assert_eq!(projects[1].sessions.len(), 1);
+        assert_eq!(projects[1].sessions[0].title, "Fix the login");
+        assert!(projects[0].sessions.is_empty());
+    }
+
+    #[test]
+    fn claude_sessions_skip_archived_and_belong_where_they_started() {
+        let live = serde_json::json!({
+            "sessionId": "local_abc", "cwd": "D:\\work\\site\\.claude\\worktrees\\x",
+            "originCwd": "D:\\work\\site", "title": "Fix it", "lastActivityAt": 5000,
+            "model": "claude-opus-5-5", "isArchived": false
+        });
+        let (folder, thread) = claude_session(&live).unwrap();
+        assert!(same_path(&folder, Path::new(r"d:\work\site\")));
+        assert_eq!((thread.id.as_str(), thread.last), ("local_abc", 5));
+        assert_eq!(thread.model.as_deref(), Some("Opus 5.5"));
+        let archived =
+            serde_json::json!({ "sessionId": "local_x", "cwd": "D:\\a", "isArchived": true });
+        assert!(claude_session(&archived).is_none());
     }
 
     #[test]

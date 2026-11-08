@@ -859,14 +859,144 @@ pub struct Compose {
     pub note: Option<(String, bool)>,
     /// Put the cursor in the field on the next frame.
     pub focus: bool,
-    /// The project list is open in place of the field.
-    pub picking: bool,
+    /// Which list is open in place of the field.
+    pub picking: Picking,
+    /// The existing session chosen per agent; None starts a new one.
+    pub session: [Option<String>; 2],
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum Picking {
+    #[default]
+    Nothing,
+    Project,
+    Session,
+}
+
+/// What the composer's button does.
+pub enum Send {
+    /// A new session in this folder, with the text filled in.
+    New(std::path::PathBuf),
+    /// An existing session, by id and title.
+    Existing(String, String),
+}
+
+/// A row that opens a list: label on the left, the current value on the right.
+fn picker_row(ui: &egui::Ui, row: Rect, id: &str, label: &str, value: &str, open: bool) -> bool {
+    let response = ui
+        .interact(row, ui.id().with(id), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, value));
+    let painter = ui.painter();
+    field(painter, row, open || response.hovered());
+    painter.text(
+        Pos2::new(row.left() + 12.0, row.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        regular(11.5),
+        SECONDARY,
+    );
+    let shown: String = if value.chars().count() > 26 {
+        format!("{}…", value.chars().take(25).collect::<String>().trim_end())
+    } else {
+        value.to_owned()
+    };
+    painter.text(
+        Pos2::new(row.right() - 30.0, row.center().y),
+        egui::Align2::RIGHT_CENTER,
+        shown,
+        strong(12.5),
+        LABEL,
+    );
+    painter.text(
+        Pos2::new(row.right() - 14.0, row.center().y),
+        egui::Align2::CENTER_CENTER,
+        if open { "▴" } else { "▾" },
+        regular(11.0),
+        SECONDARY,
+    );
+    response.clicked()
+}
+
+/// One line of a list: the title, and quieter text on the right.
+struct Choice {
+    title: String,
+    side: Option<String>,
+    tooltip: Option<String>,
+    selected: bool,
+}
+
+/// The scrolling list that opens in place of the field. Returns the line clicked.
+fn pick_list(ui: &mut egui::Ui, area: Rect, id: &str, choices: &[Choice]) -> Option<usize> {
+    ui.painter()
+        .rect_filled(area, 10.0, Color32::from_black_alpha(65));
+    let mut picked = None;
+    ui.scope_builder(egui::UiBuilder::new().max_rect(area.shrink(3.0)), |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.spacing_mut().scroll.bar_width = 4.0;
+        egui::ScrollArea::vertical().id_salt(id).show(ui, |ui| {
+            for (i, choice) in choices.iter().enumerate() {
+                let (line, mut response) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), 22.0),
+                    egui::Sense::click(),
+                );
+                response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if let Some(tooltip) = &choice.tooltip {
+                    response = response.on_hover_text(tooltip);
+                }
+                let painter = ui.painter();
+                if choice.selected {
+                    painter.rect_filled(line, 7.0, Color32::from_white_alpha(22));
+                } else if response.hovered() {
+                    painter.rect_filled(line, 7.0, Color32::from_white_alpha(8));
+                }
+                let side = choice
+                    .side
+                    .clone()
+                    .map(|text| painter.layout_no_wrap(text, regular(10.5), GRAY));
+                let right = line.right() - side.as_ref().map_or(9.0, |side| side.size().x + 20.0);
+                // Long titles are cut by the column, never run into the side text.
+                painter
+                    .with_clip_rect(Rect::from_min_max(
+                        line.min,
+                        Pos2::new(right, line.bottom()),
+                    ))
+                    .text(
+                        Pos2::new(line.left() + 9.0, line.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &choice.title,
+                        strong(12.0),
+                        if choice.selected { LABEL } else { SECONDARY },
+                    );
+                if let Some(side) = side {
+                    painter.galley(
+                        Pos2::new(right + 8.0, line.center().y - side.size().y / 2.0),
+                        side,
+                        GRAY,
+                    );
+                }
+                if response.clicked() {
+                    picked = Some(i);
+                }
+            }
+        });
+    });
+    picked
+}
+
+fn ago(at: u64, now: u64) -> String {
+    let since = elapsed(at, now);
+    if now.saturating_sub(at) < 60 {
+        since
+    } else {
+        t!("{since} тому", "{since} назад", "{since} ago")
+    }
 }
 
 const FIELD_HEIGHT: f32 = 92.0;
 
 pub fn compose_size() -> Vec2 {
-    Vec2::new(WIDTH, PAD + 246.0 + FIELD_HEIGHT - 88.0 + 30.0 + PAD)
+    Vec2::new(WIDTH, PAD + 286.0 + FIELD_HEIGHT - 88.0 + 30.0 + PAD)
 }
 
 /// Window size for the composer above the cat.
@@ -879,8 +1009,7 @@ pub struct ComposeOut {
     pub area: Rect,
     /// The text field has the keyboard.
     pub typing: bool,
-    /// Start the task in this folder.
-    pub send: Option<std::path::PathBuf>,
+    pub send: Option<Send>,
     pub close: bool,
 }
 
@@ -904,15 +1033,21 @@ pub fn compose(
         close: false,
     };
     let app = crate::launch::APPS[state.agent];
-    // The model the app will start the session with, when it tells us (Claude environments do).
+    // The model it will run with, when the app tells us: the session's, else the project's.
     let model = {
         let list = &projects[state.agent];
-        state.project[state.agent]
+        let project = state.project[state.agent]
             .as_ref()
             .and_then(|path| list.iter().find(|project| &project.path == path))
             .or_else(|| list.iter().find(|project| project.preferred))
-            .or(list.first())
-            .and_then(|project| project.model.clone())
+            .or(list.first());
+        project.and_then(|project| {
+            state.session[state.agent]
+                .as_ref()
+                .and_then(|id| project.sessions.iter().find(|thread| &thread.id == id))
+                .and_then(|thread| thread.model.clone())
+                .or_else(|| project.model.clone())
+        })
     };
     {
         let painter = ui.painter();
@@ -954,7 +1089,7 @@ pub fn compose(
     if let Some(agent) = segmented(ui, switch, "compose-agent", &agents, state.agent) {
         state.agent = agent;
         state.note = None;
-        state.picking = false;
+        state.picking = Picking::Nothing;
     }
     // Which project: the one the app has current by default; the row opens the list.
     let list = &projects[state.agent];
@@ -967,103 +1102,99 @@ pub fn compose(
                 .or(list.first())
                 .map(|project| project.path.clone())
         });
-    let name = chosen
+    let current = chosen
         .as_ref()
-        .and_then(|path| list.iter().find(|project| &project.path == path))
-        .map_or_else(
-            || s("немає проєктів", "нет проектов", "no projects").to_owned(),
-            |project| project.name.clone(),
-        );
-    let row = Rect::from_min_size(Pos2::new(left, top + 102.0), Vec2::new(right - left, 32.0));
-    let response = ui
-        .interact(row, ui.id().with("compose-project"), egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, name.clone()));
-    if response.clicked() {
-        state.picking = !state.picking;
-    }
-    {
-        let painter = ui.painter();
-        field(painter, row, state.picking || response.hovered());
-        painter.text(
-            Pos2::new(row.left() + 12.0, row.center().y),
-            egui::Align2::LEFT_CENTER,
-            s("Проєкт", "Проект", "Project"),
-            regular(11.5),
-            SECONDARY,
-        );
-        painter.text(
-            Pos2::new(row.right() - 30.0, row.center().y),
-            egui::Align2::RIGHT_CENTER,
-            &name,
-            strong(12.5),
-            LABEL,
-        );
-        painter.text(
-            Pos2::new(row.right() - 14.0, row.center().y),
-            egui::Align2::CENTER_CENTER,
-            if state.picking { "▴" } else { "▾" },
-            regular(11.0),
-            SECONDARY,
-        );
-    }
-    let area = Rect::from_min_size(
-        Pos2::new(left, top + 146.0),
-        Vec2::new(right - left, FIELD_HEIGHT),
+        .and_then(|path| list.iter().find(|project| &project.path == path));
+    let name = current.map_or_else(
+        || s("немає проєктів", "нет проектов", "no projects").to_owned(),
+        |project| project.name.clone(),
     );
-    if state.picking {
+    let width = right - left;
+    let toggle = |picking: &mut Picking, which: Picking| {
+        *picking = if *picking == which {
+            Picking::Nothing
+        } else {
+            which
+        };
+    };
+    let row = Rect::from_min_size(Pos2::new(left, top + 102.0), Vec2::new(width, 32.0));
+    let open = state.picking == Picking::Project;
+    if picker_row(
+        ui,
+        row,
+        "compose-project",
+        s("Проєкт", "Проект", "Project"),
+        &name,
+        open,
+    ) {
+        toggle(&mut state.picking, Picking::Project);
+    }
+    // Which session in it: a new one by default.
+    let sessions: &[crate::projects::Thread] = current.map_or(&[], |project| &project.sessions);
+    let thread = state.session[state.agent]
+        .as_ref()
+        .and_then(|id| sessions.iter().find(|thread| &thread.id == id));
+    let untitled = s("Без назви", "Без названия", "Untitled");
+    let title = |thread: &crate::projects::Thread| {
+        if thread.title.is_empty() {
+            untitled.to_owned()
+        } else {
+            thread.title.clone()
+        }
+    };
+    let new_session = s("Нова сесія", "Новая сессия", "New session");
+    let row = Rect::from_min_size(Pos2::new(left, top + 142.0), Vec2::new(width, 32.0));
+    let open = state.picking == Picking::Session;
+    let value = thread.map_or_else(|| new_session.to_owned(), title);
+    if picker_row(
+        ui,
+        row,
+        "compose-session",
+        s("Сесія", "Сессия", "Session"),
+        &value,
+        open,
+    ) {
+        toggle(&mut state.picking, Picking::Session);
+    }
+    let area = Rect::from_min_size(Pos2::new(left, top + 186.0), Vec2::new(width, FIELD_HEIGHT));
+    let agent = state.agent;
+    if state.picking == Picking::Session {
+        let now = crate::usage::now();
+        let mut choices = vec![Choice {
+            title: new_session.to_owned(),
+            side: None,
+            tooltip: None,
+            selected: thread.is_none(),
+        }];
+        choices.extend(sessions.iter().map(|item| Choice {
+            title: title(item),
+            side: Some(match &item.model {
+                Some(model) => format!("{} · {model}", ago(item.last, now)),
+                None => ago(item.last, now),
+            }),
+            tooltip: Some(title(item)),
+            selected: thread.is_some_and(|thread| thread.id == item.id),
+        }));
+        if let Some(i) = pick_list(ui, area, "compose-sessions", &choices) {
+            state.session[agent] = i.checked_sub(1).map(|i| sessions[i].id.clone());
+            state.picking = Picking::Nothing;
+            state.note = None;
+        }
+    } else if state.picking == Picking::Project {
         // The projects, in the app's own order, in place of the field; scroll for more.
-        ui.painter()
-            .rect_filled(area, 10.0, Color32::from_black_alpha(65));
-        let agent = state.agent;
-        let mut picked = None;
-        ui.scope_builder(egui::UiBuilder::new().max_rect(area.shrink(3.0)), |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ui.spacing_mut().scroll.bar_width = 4.0;
-            egui::ScrollArea::vertical()
-                .id_salt(("compose-projects", agent))
-                .show(ui, |ui| {
-                    for project in list {
-                        let (line, response) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), 22.0),
-                            egui::Sense::click(),
-                        );
-                        let response = response
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(project.path.display().to_string());
-                        let selected = chosen.as_ref() == Some(&project.path);
-                        let painter = ui.painter();
-                        if selected {
-                            painter.rect_filled(line, 7.0, Color32::from_white_alpha(22));
-                        } else if response.hovered() {
-                            painter.rect_filled(line, 7.0, Color32::from_white_alpha(8));
-                        }
-                        painter.text(
-                            Pos2::new(line.left() + 9.0, line.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            &project.name,
-                            strong(12.0),
-                            if selected { LABEL } else { SECONDARY },
-                        );
-                        if let Some(model) = &project.model {
-                            painter.text(
-                                Pos2::new(line.right() - 12.0, line.center().y),
-                                egui::Align2::RIGHT_CENTER,
-                                model,
-                                regular(10.5),
-                                GRAY,
-                            );
-                        }
-                        if response.clicked() {
-                            picked = Some(project.path.clone());
-                        }
-                    }
-                });
-        });
-        if let Some(path) = picked {
-            state.project[agent] = Some(path);
-            state.picking = false;
+        let choices: Vec<Choice> = list
+            .iter()
+            .map(|project| Choice {
+                title: project.name.clone(),
+                side: project.model.clone(),
+                tooltip: Some(project.path.display().to_string()),
+                selected: chosen.as_ref() == Some(&project.path),
+            })
+            .collect();
+        if let Some(i) = pick_list(ui, area, "compose-projects", &choices) {
+            state.project[agent] = Some(list[i].path.clone());
+            state.session[agent] = None; // sessions belong to the project just left
+            state.picking = Picking::Nothing;
         }
         if list.is_empty() {
             ui.painter().text(
@@ -1110,9 +1241,23 @@ pub fn compose(
     let enter = out.typing
         && ui.input(|input| input.key_pressed(egui::Key::Enter) && !input.modifiers.shift);
     // The result of the last try, or how to send.
-    let footer = top + 146.0 + FIELD_HEIGHT + 14.0;
+    let footer = top + 186.0 + FIELD_HEIGHT + 14.0;
     let (message, tone) = match &state.note {
         Some((message, ok)) => (message.clone(), if *ok { READY } else { STOP }),
+        // An open session takes no text through its link, so the text goes to the clipboard.
+        None if thread.is_some() && !state.text.trim().is_empty() => (
+            s(
+                "Текст скопіюється, встав Ctrl+V",
+                "Текст скопируется, вставь Ctrl+V",
+                "Text gets copied, paste with Ctrl+V",
+            )
+            .to_owned(),
+            GRAY,
+        ),
+        None if thread.is_some() => (
+            s("Enter — відкрити", "Enter — открыть", "Enter to open").to_owned(),
+            GRAY,
+        ),
         None => (
             s("Enter — запустити", "Enter — запустить", "Enter to start").to_owned(),
             GRAY,
@@ -1131,13 +1276,18 @@ pub fn compose(
         ui,
         start,
         "compose-start",
-        s("Запустити", "Запустить", "Start"),
+        if thread.is_some() {
+            s("Відкрити", "Открыть", "Open")
+        } else {
+            s("Запустити", "Запустить", "Start")
+        },
         color,
     ) || enter
     {
-        match chosen {
-            Some(path) => out.send = Some(path),
-            None => {
+        match (thread, chosen) {
+            (Some(thread), _) => out.send = Some(Send::Existing(thread.id.clone(), title(thread))),
+            (None, Some(path)) => out.send = Some(Send::New(path)),
+            (None, None) => {
                 state.note = Some((
                     s(
                         "Немає проєкту для запуску",

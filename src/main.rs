@@ -677,20 +677,40 @@ impl eframe::App for Companion {
                         if out.close {
                             self.compose_close_at = Some(clock);
                         }
-                        if let Some(folder) = out.send {
+                        if let Some(send) = out.send {
                             let agent = self.compose.agent;
-                            match launch::start(agent, &folder, &self.compose.text) {
-                                Ok(()) => {
-                                    let app = launch::APPS[agent];
-                                    let project = activity::folder_name(&folder.to_string_lossy());
-                                    self.compose.note = Some((
+                            let app = launch::APPS[agent];
+                            let text = self.compose.text.trim().to_owned();
+                            let result = match &send {
+                                panel::Send::New(folder) => launch::start(agent, folder, &text)
+                                    .map(|()| {
+                                        let project =
+                                            activity::folder_name(&folder.to_string_lossy());
                                         t!(
                                             "Відкрито в {app} · {project}",
                                             "Открыто в {app} · {project}",
                                             "Opened in {app} · {project}"
-                                        ),
-                                        true,
-                                    ));
+                                        )
+                                    }),
+                                panel::Send::Existing(id, title) => {
+                                    launch::open_session(agent, id).map(|()| {
+                                        if text.is_empty() {
+                                            t!(
+                                                "Відкрито: {title}",
+                                                "Открыто: {title}",
+                                                "Opened: {title}"
+                                            )
+                                        } else {
+                                            // The apps' session links take no text.
+                                            ctx.copy_text(text.clone());
+                                            s_paste()
+                                        }
+                                    })
+                                }
+                            };
+                            match result {
+                                Ok(message) => {
+                                    self.compose.note = Some((message, true));
                                     self.compose.text.clear();
                                     self.compose_close_at = Some(clock + 1.8);
                                 }
@@ -798,7 +818,7 @@ impl eframe::App for Companion {
             if close {
                 self.compose.open = false;
                 self.compose.note = None;
-                self.compose.picking = false;
+                self.compose.picking = panel::Picking::Nothing;
                 self.compose_area = None;
                 self.compose_typing = false;
                 self.compose_away = None;
@@ -867,6 +887,15 @@ fn spent(minutes: &[(u64, u64)], records: &[Record], now: u64) -> [Option<u64>; 
 /// first frame, and egui reports the old position until then. Resizing before it settles would
 /// anchor the cat to that stale corner and send it to the top left of the screen.
 const SETTLE_SECONDS: f64 = 0.8;
+
+fn s_paste() -> String {
+    i18n::s(
+        "Відкрито · текст у буфері, встав Ctrl+V",
+        "Открыто · текст в буфере, вставь Ctrl+V",
+        "Opened · text copied, paste with Ctrl+V",
+    )
+    .to_owned()
+}
 
 /// How long the pointer rests on the sleeping cat before the task composer opens.
 const COMPOSE_DWELL: f64 = 0.6;
