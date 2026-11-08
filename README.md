@@ -4,7 +4,7 @@
 
 **A quiet companion for your AI coding sessions.**
 
-A small desktop cat that keeps Claude and Codex quotas close at hand.
+A small desktop cat that keeps Claude, Codex and Kimi Code quotas close at hand.
 
 ![Void](assets/cat-awake.png)
 
@@ -14,9 +14,9 @@ Rust · Windows · Local first · MIT
 
 ## What Void does
 
-Click the cat to open the menu. It answers one question: can I use each agent right now, and what is left? At the top, one line built from the same data as the agent below it. Tabs switch between Claude and Codex; each tab carries a dot in that agent's status color. The chosen agent shows its status (Ready to work, Running low, Paused until 19:28, or why there is no data) and its two limits side by side, the five-hour window and the weekly one: how much is left, a bar, when it resets, and how many tokens were spent in that window. Subscriptions report quota as percentages; token counts come from the agents' local transcripts (fresh input, cache writes and output). Claude chat on the web or phone shares the quota but is not in those transcripts. The menu closes after 30 seconds without the pointer on it or the cat, and at once when you click another window. The gear opens settings.
+Click the cat to open the menu. It answers one question: can I use each agent right now, and what is left? At the top, one line built from the same data as the agent below it. Tabs switch between the agents installed on this machine (Claude, Codex, Kimi Code; the others do not appear anywhere in Void); each tab carries a dot in that agent's status color. The chosen agent shows its status (Ready to work, Running low, Paused until 19:28, or why there is no data) and its two limits side by side, the five-hour window and the weekly one: how much is left, a bar, when it resets, and how many tokens were spent in that window. Subscriptions report quota as percentages; token counts come from the agents' local transcripts (fresh input, cache writes and output). Claude chat on the web or phone shares the quota but is not in those transcripts. The menu closes after 30 seconds without the pointer on it or the cat, and at once when you click another window. The gear opens settings.
 
-Rest the pointer on the sleeping cat to start a task. Pick the agent and the project, from the app's own project list in its sidebar order and names (Claude Desktop's environments, the Codex app's projects), with the app's current project chosen by default and, for Claude, each project's model shown; write what to do, and press Enter (Shift+Enter for a new line). Void opens the task in the desktop app you work in, through the app's own link: a new Claude Code session in Claude Desktop (`claude://code/new`) or a new thread in the Codex app (`codex://threads/new`), in that folder with your text filled in. The app takes it from there, with its usual review and approvals. Below the project, pick a session: a new one by default, or one of the project's existing sessions, newest first. An existing session opens in its app (`claude://code/continue`, `codex://threads/<id>`); those links take no text, so what you wrote goes to the clipboard to paste with Ctrl+V. Esc or the cross closes the composer and keeps the draft.
+Rest the pointer on the sleeping cat to start a task. Pick the agent and the project, from the app's own project list in its sidebar order and names (Claude Desktop's environments, the Codex app's projects), with the app's current project chosen by default and, for Claude, each project's model shown; write what to do, and press Enter (Shift+Enter for a new line). Void opens the task in the desktop app you work in, through the app's own link: a new Claude Code session in Claude Desktop (`claude://code/new`) or a new thread in the Codex app (`codex://threads/new`), in that folder with your text filled in. The app takes it from there, with its usual review and approvals. Below the project, pick a session: a new one by default, or one of the project's existing sessions, newest first. An existing session opens in its app (`claude://code/continue`, `codex://threads/<id>`); those links take no text, so what you wrote goes to the clipboard to paste with Ctrl+V. Kimi Code's link opens a new session in the chosen folder but takes no text, and it has no link to an existing session: Void opens the session and puts your text on the clipboard to paste with Ctrl+V. Esc or the cross closes the composer and keeps the draft.
 
 Every window is built from the same parts: one glass surface (with a thin line in the agent's color on agent windows), one header, one switch for tabs, language and agent choice, one field shape, and one filled button.
 
@@ -27,8 +27,9 @@ Every window is built from the same parts: one glass surface (with a thin line i
 - Transparent animated cat, draggable across the desktop.
 - Windows system tray, optional startup and notifications; no taskbar button.
 - Explicit missing and stale data. Unknown values stay unknown.
-- A thought bubble above the cat while Claude Code or Codex is working. Hover it for a quiet card: each running session with its project, elapsed time and current step (a tool, or "thinking"), and both quota windows as numbers. Click the bubble to open the menu, where the details are.
-- A mystical bell when an agent finishes a turn, the same for Claude and Codex: inharmonic partials, a slow shimmer and a soft echo. Synthesized locally, no sound files.
+- A thought bubble above the cat while Claude Code, Codex or Kimi Code is working. Hover it for a quiet card: each running session with its project, elapsed time and current step (a tool, or "thinking"), and both quota windows as numbers. Click the bubble to open the menu, where the details are.
+- A check mark above the cat when an agent finishes a turn. Hover it to see the project and the task; click it to open the app there (the exact session for Claude Desktop and Codex, the project for Kimi Code). It goes away when clicked, when that session starts working again, or after an hour.
+- A mystical bell when an agent finishes a turn, the same for every agent: inharmonic partials, a slow shimmer and a soft echo. Synthesized locally, no sound files.
 - Settings behind the gear in the panel: interface language (Українська, Русский, English) and the finish sound, saved in `~/.void/settings.json`.
 - Advice on where the next task should go, from how many typical turns each agent's five-hour quota still holds.
 
@@ -50,6 +51,8 @@ Click the cat to open or close the panel. Drag it to move it. Right-click the tr
 | Claude Desktop quota history | Desktop-owned percentage snapshots | Undocumented v2 cache; refresh is controlled by Claude; no reset timestamps |
 | Claude transcript block events | Explicit quota rejection and reset time | Only available after a recorded block |
 | Claude Code account endpoint | Current quota using an existing local CLI login | Undocumented endpoint; may be unavailable or change |
+| Kimi Code account endpoint | Current quota using the app's own login | Undocumented endpoint; the login lives 15 minutes and only the app renews it, so quota updates while Kimi Code is in use |
+| Kimi Code session logs | Running turns, tokens, finished tasks | Local `~/.kimi-code` format may change |
 
 Void has no separate sign-in. Existing authorization belongs to the native client. A Desktop login does not imply a CLI credential file exists. Void does not read Desktop cookies or trigger Keychain permission dialogs.
 
@@ -108,7 +111,7 @@ The first command reports source availability. The second observes background up
 
 Void stores bounded numeric Claude history locally. It also remembers finished agent turns in `~/.void/turns.jsonl`: agent, project folder name, start and end time, and the first 1000 characters of your prompt. Prompts are used only on this machine, to find similar past work for forecasts; they are never sent anywhere. Set `VOID_NO_PROMPTS=1` to keep turns without text, or delete the file to forget them. Responses, tool output and other conversation content are not stored. Void does not watch running processes; it reads only the agents' own local transcripts.
 
-Account requests go to the provider through Codex app-server or, for the optional Claude CLI source, the Anthropic quota endpoint. Claude CLI credentials are passed to system curl through stdin, not command-line arguments. Five minutes before the CLI access token expires, Void refreshes it the way Claude Code does: under Claude Code's own refresh lock, writing the new tokens back atomically to `.credentials.json`, so the CLI and Void keep sharing one login. Refresh attempts are limited to one per five minutes.
+Account requests go to the provider through Codex app-server or, for the optional Claude CLI and Kimi Code sources, their quota endpoints. Void only reads Kimi Code's login and never renews it. Claude CLI credentials are passed to system curl through stdin, not command-line arguments. Void never writes that login. Five minutes before the CLI access token expires, Void runs one short headless Claude Code turn (`claude -p ok --model haiku --no-session-persistence`, about once in eight hours, a small amount of quota), and Claude Code renews its own login. A failed attempt waits an hour.
 
 The installer preserves an existing Claude status line and chains its output. Uninstallation restores it. Manual commands: `void connect-statusline` and `void disconnect-statusline`. Invalid settings JSON is left untouched. History remains after uninstall; close Void before deleting `~/.void` to remove it.
 

@@ -17,6 +17,7 @@ pub enum Failure {
     Denied,
     Network,
     Unavailable,
+    RateLimited,
     Format,
 }
 impl Failure {
@@ -39,29 +40,31 @@ impl Failure {
             ),
             Self::Network => s("Немає зв’язку", "Нет связи", "No connection"),
             Self::Unavailable => s("Квоти недоступні", "Квоты недоступны", "Quota unavailable"),
+            Self::RateLimited => s(
+                "Claude обмежив запити, спробую пізніше",
+                "Claude ограничил запросы, попробую позже",
+                "Claude rate-limited us, retrying later",
+            ),
             Self::Format => s("Невідомий формат", "Неизвестный формат", "Unknown format"),
         }
     }
 }
-// Claude Code's own production OAuth endpoint and public client id, as its refresh uses them.
-const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// Refresh this long before expiry, the same margin Claude Code uses.
 const REFRESH_MARGIN_MS: u64 = 5 * 60 * 1000;
-/// At most one refresh request per this pause: the token endpoint rate-limits (429) eager clients.
-const REFRESH_PAUSE_MS: u64 = 5 * 60 * 1000;
-static LAST_REFRESH_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A failed renewal is not retried sooner than this: each attempt is a real Claude Code turn.
+const RENEW_PAUSE_MS: u64 = 60 * 60 * 1000;
+static NEXT_RENEW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn account_sample() -> Result<Sample, Failure> {
     let dir = config_dir().ok_or(Failure::Login)?;
     let credentials = read_credentials(&dir).ok_or(Failure::Login)?;
     let mut token = access_token(&credentials).ok_or(Failure::Login)?;
     if expires_soon(&credentials, now_ms()) {
-        token = refresh(&dir, &token)?;
+        token = renew(&dir, &token)?;
     }
     let body = match fetch(&token) {
-        // The token can be revoked before its expiry: refresh once and retry.
-        Err(Failure::Expired) => fetch(&refresh(&dir, &token)?)?,
+        // The token can be revoked before its expiry: renew once and retry.
+        Err(Failure::Expired) => fetch(&renew(&dir, &token)?)?,
         result => result?,
     };
     sample_from_usage(&serde_json::from_slice(&body).map_err(|_| Failure::Format)?)
@@ -84,7 +87,7 @@ fn read_credentials(dir: &Path) -> Option<Value> {
 }
 
 /// Tokens go into curl config lines, so reject anything that could break out of a quoted value.
-fn safe(token: &str) -> bool {
+pub(crate) fn safe(token: &str) -> bool {
     !token.is_empty()
         && token
             .bytes()
@@ -105,136 +108,58 @@ fn expires_soon(credentials: &Value, now: u64) -> bool {
         .is_some_and(|at| now + REFRESH_MARGIN_MS >= at)
 }
 
-/// Refresh the login exactly as Claude Code does: under its lock, writing the new tokens back,
-/// so the CLI and Void keep sharing one login. `used` is the token we already have.
-fn refresh(dir: &Path, used: &str) -> Result<String, Failure> {
-    // Claude Code is refreshing right now: its new token lands on disk, pick it up next poll.
-    let _lock = Lock::acquire(dir).ok_or(Failure::Unavailable)?;
-    let mut credentials = read_credentials(dir).ok_or(Failure::Login)?;
-    let current = access_token(&credentials).ok_or(Failure::Login)?;
-    if current != used {
-        return Ok(current); // someone refreshed while we waited
+/// Claude Code renews its own login, and Void only reads the result: the token endpoint
+/// answered Void's own requests with 429 while the CLI's went through.
+fn renew(dir: &Path, used: &str) -> Result<String, Failure> {
+    let current = |dir| read_credentials(dir).and_then(|login| access_token(&login));
+    let fresh = current(dir).ok_or(Failure::Login)?;
+    if fresh != used {
+        return Ok(fresh); // renewed since we read it
     }
     let now = now_ms();
-    let last = LAST_REFRESH_MS.load(std::sync::atomic::Ordering::Relaxed);
-    if last != 0 && now < last + REFRESH_PAUSE_MS {
-        return Err(Failure::Unavailable);
+    if now < NEXT_RENEW_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(Failure::Expired);
     }
-    LAST_REFRESH_MS.store(now, std::sync::atomic::Ordering::Relaxed);
-    let refresh_token = credentials
-        .pointer("/claudeAiOauth/refreshToken")
-        .and_then(Value::as_str)
-        .filter(|token| safe(token))
-        .ok_or(Failure::Expired)?;
-    let mut body = serde_json::json!({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": CLIENT_ID,
-    });
-    if let Some(scopes) = credentials
-        .pointer("/claudeAiOauth/scopes")
-        .and_then(Value::as_array)
-    {
-        let scopes: Vec<&str> = scopes.iter().filter_map(Value::as_str).collect();
-        body["scope"] = scopes.join(" ").into();
+    NEXT_RENEW_MS.store(now + RENEW_PAUSE_MS, std::sync::atomic::Ordering::Relaxed);
+    if !run_claude_code() {
+        return Err(Failure::Expired);
     }
-    let data = body.to_string().replace('"', "\\\"");
-    let (response, code) = curl(
-        TOKEN_URL,
-        &format!("header = \"Content-Type: application/json\"\ndata = \"{data}\"\n"),
-    )?;
-    match code.as_slice() {
-        b"200" => {}
-        // invalid_grant: the refresh token is dead, only a new /login helps.
-        b"400" | b"401" => return Err(Failure::Expired),
-        // 429 and server errors: the old token stays, the next attempt waits out REFRESH_PAUSE_MS.
-        _ => return Err(Failure::Unavailable),
-    }
-    let response: Value = serde_json::from_slice(&response).map_err(|_| Failure::Format)?;
-    apply_refresh(&mut credentials, &response, now_ms()).ok_or(Failure::Format)?;
-    write_credentials(dir, &credentials).map_err(|_| Failure::Unavailable)?;
-    access_token(&credentials).ok_or(Failure::Format)
+    current(dir)
+        .filter(|token| token != used)
+        .ok_or(Failure::Expired)
 }
 
-/// Merge a token response into the stored login, keeping every other field.
-fn apply_refresh(credentials: &mut Value, response: &Value, now: u64) -> Option<()> {
-    let oauth = credentials.get_mut("claudeAiOauth")?.as_object_mut()?;
-    let access = response.get("access_token")?.as_str()?;
-    let expires_in = response.get("expires_in")?.as_u64()?;
-    if !safe(access) {
-        return None;
-    }
-    oauth.insert("accessToken".into(), access.into());
-    oauth.insert("expiresAt".into(), (now + expires_in * 1000).into());
-    if let Some(token) = response.get("refresh_token").and_then(Value::as_str) {
-        oauth.insert("refreshToken".into(), token.into());
-    }
-    if let Some(seconds) = response
-        .get("refresh_token_expires_in")
-        .and_then(Value::as_u64)
-    {
-        oauth.insert(
-            "refreshTokenExpiresAt".into(),
-            (now + seconds * 1000).into(),
-        );
-    }
-    if let Some(scope) = response.get("scope").and_then(Value::as_str) {
-        oauth.insert(
-            "scopes".into(),
-            scope.split_whitespace().collect::<Vec<_>>().into(),
-        );
-    }
-    Some(())
-}
-
-/// Replace the file atomically: a reader never sees half a login.
-fn write_credentials(dir: &Path, credentials: &Value) -> std::io::Result<()> {
-    let path = credentials_path(dir);
-    let temporary = path.with_extension("json.void-tmp");
-    fs::write(&temporary, serde_json::to_vec(credentials)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
-    }
-    fs::rename(&temporary, &path).inspect_err(|_| {
-        let _ = fs::remove_file(&temporary);
-    })
-}
-
-/// Claude Code's refresh lock: the directories `<dir>/.oauth_refresh.lock` and `<dir>.lock`
-/// (proper-lockfile, stale after 60 s). Held while refreshing, removed on drop.
-struct Lock(Vec<PathBuf>);
-
-impl Lock {
-    fn acquire(dir: &Path) -> Option<Self> {
-        let mut legacy = dir.as_os_str().to_owned();
-        legacy.push(".lock");
-        let mut lock = Lock(Vec::new());
-        for path in [dir.join(".oauth_refresh.lock"), PathBuf::from(legacy)] {
-            if fs::create_dir(&path).is_err() {
-                // A holder that died leaves the directory behind; Claude Code treats 60 s as dead too.
-                let stale = fs::metadata(&path)
-                    .and_then(|meta| meta.modified())
-                    .ok()
-                    .and_then(|at| at.elapsed().ok())
-                    .is_some_and(|age| age > std::time::Duration::from_secs(60));
-                if !(stale && fs::remove_dir(&path).is_ok() && fs::create_dir(&path).is_ok()) {
-                    return None; // dropping `lock` releases what we already hold
-                }
-            }
-            lock.0.push(path);
-        }
-        Some(lock)
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        for path in self.0.iter().rev() {
-            let _ = fs::remove_dir(path);
+/// One short headless turn, which makes the CLI renew its login. Saves no session.
+fn run_claude_code() -> bool {
+    #[cfg(windows)]
+    let mut command = {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("cmd");
+        // npm installs `claude` as a .cmd, which only cmd can start.
+        command.args(["/C", "claude"]).creation_flags(0x08000000);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = Command::new("claude");
+    command
+        .args(["-p", "ok", "--model", "haiku", "--no-session-persistence"])
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    for _ in 0..240 {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
+            Err(_) => return false,
         }
     }
+    // shortcut: kills cmd, not its child; a hung CLI lingers until it exits by itself.
+    let _ = child.kill();
+    false
 }
 
 fn fetch(token: &str) -> Result<Vec<u8>, Failure> {
@@ -248,12 +173,13 @@ fn fetch(token: &str) -> Result<Vec<u8>, Failure> {
         b"200" => Ok(body),
         b"401" => Err(Failure::Expired),
         b"403" => Err(Failure::Denied),
+        b"429" => Err(Failure::RateLimited),
         _ => Err(Failure::Unavailable),
     }
 }
 
 /// POST/GET through the system curl. Secrets travel in `config` over stdin, never in the process list.
-fn curl(url: &str, config: &str) -> Result<(Vec<u8>, Vec<u8>), Failure> {
+pub(crate) fn curl(url: &str, config: &str) -> Result<(Vec<u8>, Vec<u8>), Failure> {
     #[cfg(windows)]
     let curl = PathBuf::from(std::env::var_os("SystemRoot").ok_or(Failure::Unavailable)?)
         .join("System32/curl.exe");
@@ -347,65 +273,13 @@ mod tests {
     }
 
     #[test]
-    fn refresh_response_updates_tokens_and_keeps_the_rest() {
-        let mut credentials = serde_json::json!({
-            "mcpOAuth": {"x": 1},
-            "claudeAiOauth": {"accessToken": "old", "refreshToken": "r1", "expiresAt": 1000,
-                "scopes": ["user:inference"], "subscriptionType": "pro"}
-        });
-        assert!(expires_soon(&credentials, 0));
-        let response = serde_json::json!({"access_token": "new", "refresh_token": "r2",
-            "expires_in": 28800, "scope": "user:inference user:profile"});
-        apply_refresh(&mut credentials, &response, 10_000).unwrap();
-        let oauth = &credentials["claudeAiOauth"];
-        assert_eq!(oauth["accessToken"], "new");
-        assert_eq!(oauth["refreshToken"], "r2");
-        assert_eq!(oauth["expiresAt"], 10_000 + 28_800_000);
-        assert_eq!(oauth["scopes"][1], "user:profile");
-        assert_eq!(oauth["subscriptionType"], "pro");
-        assert_eq!(credentials["mcpOAuth"]["x"], 1);
-        assert!(!expires_soon(&credentials, 10_000));
-        // A token that could break the curl config is refused.
-        let bad = serde_json::json!({"access_token": "a\"b", "expires_in": 1});
-        assert!(apply_refresh(&mut credentials, &bad, 0).is_none());
-    }
-
-    /// Manual: rotates the real login once. `cargo test -- --ignored refreshes_the_real_login`
-    #[test]
-    #[ignore]
-    fn refreshes_the_real_login() {
-        let dir = config_dir().unwrap();
-        let before = access_token(&read_credentials(&dir).unwrap()).unwrap();
-        let after = refresh(&dir, &before).unwrap();
-        assert_ne!(before, after);
-        assert_eq!(
-            access_token(&read_credentials(&dir).unwrap()).unwrap(),
-            after
-        );
-        assert!(fetch(&after).is_ok());
-    }
-
-    #[test]
-    fn lock_is_exclusive_released_on_drop_and_written_atomically() {
-        let root = std::env::temp_dir().join(format!("void-lock-{}", std::process::id()));
-        let dir = root.join(".claude");
+    fn a_token_renewed_elsewhere_is_picked_up_without_running_the_cli() {
+        let dir = std::env::temp_dir().join(format!("void-renew-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let lock = Lock::acquire(&dir).unwrap();
-        assert!(dir.join(".oauth_refresh.lock").is_dir());
-        assert!(root.join(".claude.lock").is_dir());
-        assert!(Lock::acquire(&dir).is_none());
-        drop(lock);
-        assert!(!dir.join(".oauth_refresh.lock").exists());
-        // Claude Code holding only the legacy lock still blocks us, and we release ours.
-        fs::create_dir(root.join(".claude.lock")).unwrap();
-        assert!(Lock::acquire(&dir).is_none());
-        assert!(!dir.join(".oauth_refresh.lock").exists());
-        fs::remove_dir(root.join(".claude.lock")).unwrap();
-
-        let credentials = serde_json::json!({"claudeAiOauth": {"accessToken": "t"}});
-        write_credentials(&dir, &credentials).unwrap();
-        assert_eq!(read_credentials(&dir).unwrap(), credentials);
-        let _ = fs::remove_dir_all(root);
+        let login = serde_json::json!({"claudeAiOauth": {"accessToken": "new"}});
+        fs::write(credentials_path(&dir), login.to_string()).unwrap();
+        assert_eq!(renew(&dir, "old").ok().as_deref(), Some("new"));
+        let _ = fs::remove_dir_all(dir);
     }
 }
 

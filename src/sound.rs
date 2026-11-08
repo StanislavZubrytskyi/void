@@ -1,4 +1,4 @@
-//! A mystical bell for a finished turn, the same for Claude and Codex. Inharmonic partials (as
+//! A mystical bell for a finished turn, the same for every agent. Inharmonic partials (as
 //! in a real bronze bell), a slow shimmer from a detuned pair, and a soft echo for space.
 //! Synthesized once into an in-memory WAV, so nothing ships as an asset.
 

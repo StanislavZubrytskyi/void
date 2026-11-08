@@ -19,7 +19,7 @@ const KEEP: u64 = 30 * 86_400;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
-    /// 0 is Claude, 1 is Codex.
+    /// 0 is Claude, 1 is Codex, 2 is Kimi Code.
     pub agent: usize,
     pub project: String,
     pub start: u64,
@@ -52,6 +52,8 @@ pub fn load() -> Vec<Turn> {
         .lines()
         .map_while(Result::ok)
         .filter_map(|line| serde_json::from_str::<Turn>(&line).ok())
-        .filter(|turn| turn.agent < 2 && turn.end >= turn.start && turn.start >= cutoff)
+        .filter(|turn| {
+            turn.agent < crate::launch::AGENTS && turn.end >= turn.start && turn.start >= cutoff
+        })
         .collect()
 }

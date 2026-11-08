@@ -12,12 +12,16 @@ pub enum Update {
     Claude(Vec<Record>, Vec<Record>),
     ClaudeAccount(Result<Record, claude::Failure>),
     Codex(Vec<Record>, bool),
-    /// Busy sessions: Claude, then Codex.
-    Activity([Vec<crate::activity::Session>; 2]),
-    /// An agent (0 Claude, 1 Codex) just finished a turn.
-    Finished(usize),
+    /// Kimi Code's quota readings.
+    Kimi(Vec<Record>),
+    /// Busy sessions per agent.
+    Activity([Vec<crate::activity::Session>; crate::launch::AGENTS]),
+    /// A turn just finished.
+    Finished(crate::activity::Done),
     /// Recent project folders per agent, newest first: choices for a new task.
-    Projects([Vec<crate::projects::Project>; 2]),
+    Projects([Vec<crate::projects::Project>; crate::launch::AGENTS]),
+    /// Which agents are on this machine.
+    Installed([bool; crate::launch::AGENTS]),
     /// Tokens an agent spent, per minute, over the last eight days.
     Tokens(usize, Vec<(u64, u64)>),
 }
@@ -26,15 +30,19 @@ pub fn start(ctx: eframe::egui::Context) -> Receiver<Update> {
     let busy = send.clone();
     let repaint = ctx.clone();
     thread::spawn(move || {
-        let mut last: Option<[Vec<crate::activity::Session>; 2]> = None;
+        let mut last: Option<[Vec<crate::activity::Session>; crate::launch::AGENTS]> = None;
         let mut recorded = std::collections::HashSet::new();
         let mut listed = None::<Instant>;
         let mut deepened = std::collections::HashSet::new();
         loop {
             if listed.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
                 listed = Some(Instant::now());
-                let found = [0, 1].map(crate::projects::list);
-                if busy.send(Update::Projects(found)).is_err() {
+                let found = [0, 1, 2].map(crate::projects::list);
+                if busy.send(Update::Projects(found)).is_err()
+                    || busy
+                        .send(Update::Installed(crate::launch::installed()))
+                        .is_err()
+                {
                     break;
                 }
             }
@@ -79,13 +87,22 @@ pub fn start(ctx: eframe::egui::Context) -> Receiver<Update> {
                             .filter(|turn| !turn.busy && turn.end >= gone.since)
                             && recorded.insert((gone.id.clone(), gone.since))
                         {
-                            finished.push(agent);
+                            let prompt = turn.prompt.or_else(|| gone.prompt.clone());
+                            finished.push(crate::activity::Done {
+                                agent,
+                                id: gone.id.clone(),
+                                project: turn.project.clone(),
+                                prompt: prompt
+                                    .clone()
+                                    .filter(|_| std::env::var_os("VOID_NO_PROMPTS").is_none()),
+                                end: turn.end,
+                            });
                             let _ = crate::turns::save(&crate::turns::Turn {
                                 agent,
                                 project: turn.project,
                                 start: gone.since,
                                 end: turn.end,
-                                prompt: turn.prompt.or_else(|| gone.prompt.clone()),
+                                prompt,
                             })
                             .is_ok();
                         }
@@ -93,7 +110,7 @@ pub fn start(ctx: eframe::egui::Context) -> Receiver<Update> {
                 }
                 if finished
                     .into_iter()
-                    .any(|agent| busy.send(Update::Finished(agent)).is_err())
+                    .any(|done| busy.send(Update::Finished(done)).is_err())
                 {
                     break;
                 }
@@ -159,6 +176,30 @@ pub fn start(ctx: eframe::egui::Context) -> Receiver<Update> {
             }
             repaint.request_repaint();
             thread::sleep(Duration::from_secs(delay));
+        }
+    });
+    let kimi = send.clone();
+    let repaint = ctx.clone();
+    thread::spawn(move || {
+        let mut rows = usage::kimi_history();
+        loop {
+            if let Some(sample) = crate::kimi::account_sample() {
+                let _ = usage::save_kimi(sample.clone());
+                rows.push(Record {
+                    time: usage::now(),
+                    sample,
+                });
+            }
+            rows = rows.split_off(rows.len().saturating_sub(300));
+            if kimi.send(Update::Kimi(rows.clone())).is_err()
+                || kimi
+                    .send(Update::Tokens(2, crate::kimi::token_minutes(usage::now())))
+                    .is_err()
+            {
+                break;
+            }
+            repaint.request_repaint();
+            thread::sleep(Duration::from_secs(30));
         }
     });
     thread::spawn(move || {

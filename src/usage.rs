@@ -148,7 +148,26 @@ pub fn append_line(json: &[u8], path: &Path) -> Result<(), Box<dyn std::error::E
 }
 
 pub fn history() -> io::Result<Vec<Record>> {
-    let file = match fs::File::open(history_path()?) {
+    read_history(&history_path()?)
+}
+
+fn kimi_path() -> io::Result<PathBuf> {
+    Ok(data_dir()?.join("kimi.jsonl"))
+}
+
+/// Kimi Code's quota readings, kept apart from Claude's.
+pub fn save_kimi(sample: Sample) -> Result<(), Box<dyn std::error::Error>> {
+    append(sample, &kimi_path()?)
+}
+
+pub fn kimi_history() -> Vec<Record> {
+    kimi_path()
+        .and_then(|path| read_history(&path))
+        .unwrap_or_default()
+}
+
+fn read_history(path: &Path) -> io::Result<Vec<Record>> {
+    let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),

@@ -35,6 +35,17 @@ pub struct Session {
     pub tokens: u64,
 }
 
+/// A turn that just finished, for the badge above the cat.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Done {
+    pub agent: usize,
+    /// The transcript file, which says where to reopen it.
+    pub id: PathBuf,
+    pub project: String,
+    pub prompt: Option<String>,
+    pub end: u64,
+}
+
 const PROMPT_CHARS: usize = 1000;
 
 /// Tokens one Claude response spent: fresh input, cache writes and output. Cache reads repeat the
@@ -59,11 +70,19 @@ pub fn codex_tokens(total: &Value) -> Option<u64> {
     )
 }
 
+/// The same measure from a Kimi usage record.
+pub fn kimi_tokens(usage: &Value) -> u64 {
+    ["inputOther", "inputCacheCreation", "output"]
+        .iter()
+        .filter_map(|key| usage.get(*key)?.as_u64())
+        .sum()
+}
+
 fn prompt_text(text: &str) -> String {
     text.trim().chars().take(PROMPT_CHARS).collect()
 }
 
-/// The last turn of one transcript: 0 is Claude, 1 is Codex.
+/// The last turn of one transcript: 0 is Claude, 1 is Codex, 2 is Kimi Code.
 pub fn read_turn(agent: usize, path: &Path) -> Option<Session> {
     read_turn_from(agent, path, TAIL)
 }
@@ -75,21 +94,38 @@ pub fn read_turn_deep(agent: usize, path: &Path) -> Option<Session> {
 
 fn read_turn_from(agent: usize, path: &Path, tail: u64) -> Option<Session> {
     let lines = tail_lines(path, tail)?;
-    let mut turn = if agent == 0 {
-        claude_turn(&lines)?
-    } else {
-        let mut turn = codex_turn(&lines)?;
-        turn.project = first_line(path)
-            .and_then(|line| codex_project(&line))
-            .unwrap_or_default();
-        turn
+    let mut turn = match agent {
+        0 => claude_turn(&lines)?,
+        1 => {
+            let mut turn = codex_turn(&lines)?;
+            turn.project = first_line(path)
+                .and_then(|line| codex_project(&line))
+                .unwrap_or_default();
+            turn
+        }
+        _ => {
+            let mut turn = kimi_turn(&lines)?;
+            turn.project = kimi_folder(path)
+                .as_deref()
+                .map(folder_name)
+                .unwrap_or_default();
+            turn
+        }
     };
     turn.id = path.to_path_buf();
     Some(turn)
 }
 
-/// Busy sessions for Claude and Codex, in that order, the longest-running first.
-pub fn scan() -> [Vec<Session>; 2] {
+/// The folder a Kimi session works in, from the `state.json` beside its log
+/// (`<session>/agents/main/wire.jsonl`).
+pub fn kimi_folder(log: &Path) -> Option<String> {
+    let bytes = std::fs::read(log.ancestors().nth(3)?.join("state.json")).ok()?;
+    let state: Value = serde_json::from_slice(&bytes).ok()?;
+    state.get("cwd")?.as_str().map(str::to_owned)
+}
+
+/// Busy sessions per agent, the longest-running first.
+pub fn scan() -> [Vec<Session>; crate::launch::AGENTS] {
     let home = || {
         std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
@@ -112,10 +148,26 @@ pub fn scan() -> [Vec<Session>; 2] {
     let mut codex = codex_home
         .map(|home| busy(1, recent(&home.join("sessions"), 3)))
         .unwrap_or_default();
-    for sessions in [&mut claude, &mut codex] {
+    // Subagents keep their own logs beside `main`; the session counts once.
+    let mut kimi = crate::kimi::home()
+        .map(|home| {
+            let logs = recent(&home.join("sessions"), 4)
+                .into_iter()
+                .filter(|path| {
+                    path.file_name().is_some_and(|name| name == "wire.jsonl")
+                        && path
+                            .parent()
+                            .and_then(Path::file_name)
+                            .is_some_and(|name| name == "main")
+                })
+                .collect();
+            busy(2, logs)
+        })
+        .unwrap_or_default();
+    for sessions in [&mut claude, &mut codex, &mut kimi] {
         sessions.sort_by_key(|session| session.since);
     }
-    [claude, codex]
+    [claude, codex, kimi]
 }
 
 /// `.jsonl` files exactly `depth` folders below `dir`, written within STALE.
@@ -383,9 +435,112 @@ fn codex_turn(lines: &[String]) -> Option<Session> {
     })
 }
 
+/// Replays a Kimi Code session log tail: `turn.prompt` opens a turn, `turn.ended` closes it.
+fn kimi_turn(lines: &[String]) -> Option<Session> {
+    let (mut busy, mut since, mut tool) = (false, 0, None);
+    let (mut end, mut prompt, mut tokens) = (0, None, 0);
+    for line in lines {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(time) = entry
+            .get("time")
+            .and_then(Value::as_u64)
+            .map(|ms| ms / 1000)
+        else {
+            continue;
+        };
+        match entry.get("type").and_then(Value::as_str) {
+            Some("turn.prompt") => {
+                busy = true;
+                since = time;
+                end = time;
+                tool = None;
+                tokens = 0;
+                // What the user typed, without what the composer expanded it into.
+                prompt = entry
+                    .pointer("/origin/clientMetadata/0/display_text")
+                    .or_else(|| entry.pointer("/input/0/text"))
+                    .and_then(Value::as_str)
+                    .map(prompt_text);
+            }
+            Some("context.append_loop_event") => {
+                if !busy {
+                    busy = true; // the tail starts mid-turn: the prompt is out of view
+                    since = time;
+                    prompt = None;
+                }
+                end = time;
+                match entry.pointer("/event/type").and_then(Value::as_str) {
+                    Some("tool.call") => {
+                        tool = entry
+                            .pointer("/event/name")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                    }
+                    Some("tool.result") => tool = None,
+                    _ => {}
+                }
+            }
+            Some("usage.record") if busy => {
+                tokens += entry.get("usage").map_or(0, kimi_tokens);
+            }
+            Some("turn.ended") => {
+                busy = false;
+                end = time;
+                // A cancelled or failed turn is not news worth a badge.
+                if entry.get("reason").and_then(Value::as_str) != Some("completed") {
+                    since = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+    (since > 0).then(|| Session {
+        id: PathBuf::new(),
+        project: String::new(),
+        since,
+        tool,
+        busy,
+        end,
+        prompt,
+        tokens,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kimi_turn_follows_prompt_tools_and_end() {
+        let prompt = serde_json::json!({"type":"turn.prompt","time":10_000,
+            "input":[{"type":"text","text":"expanded"}],
+            "origin":{"clientMetadata":[{"display_text":"add a page"}]}});
+        let event = |time: u64, kind: &str| {
+            serde_json::json!({"type":"context.append_loop_event","time":time,
+            "event":{"type":kind,"name":"Read"}})
+        };
+        let usage = serde_json::json!({"type":"usage.record","time":12_000,
+            "usage":{"inputOther":10,"output":5,"inputCacheRead":900,"inputCacheCreation":0}});
+        let ended =
+            |reason: &str| serde_json::json!({"type":"turn.ended","time":20_000,"reason":reason});
+        let running = kimi_turn(&lines(&[prompt.clone(), event(11_000, "tool.call")])).unwrap();
+        assert!(running.busy);
+        assert_eq!(running.tool.as_deref(), Some("Read"));
+        assert_eq!(running.prompt.as_deref(), Some("add a page"));
+        let done = kimi_turn(&lines(&[
+            prompt.clone(),
+            event(11_000, "tool.call"),
+            event(11_500, "tool.result"),
+            usage,
+            ended("completed"),
+        ]))
+        .unwrap();
+        assert_eq!((done.busy, done.since, done.end), (false, 10, 20));
+        assert_eq!((done.tokens, done.tool), (15, None));
+        assert!(kimi_turn(&lines(&[prompt, ended("cancelled")])).is_none());
+    }
 
     fn lines(rows: &[Value]) -> Vec<String> {
         rows.iter().map(Value::to_string).collect()

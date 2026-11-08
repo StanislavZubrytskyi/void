@@ -1,7 +1,7 @@
-//! Starting a task in the desktop app the user works in: a new Claude Code session in Claude
-//! Desktop, or a new thread in the Codex app, in the chosen project, with the text filled in.
-//! Void only opens the app's own link (`claude://code/new`, `codex://threads/new`); the app
-//! takes it from there, so its usual review and approvals apply.
+//! Starting a task in the desktop app the user works in, in the chosen project: a new Claude
+//! Code session in Claude Desktop, a new thread in the Codex app, a new session in Kimi Code.
+//! Void only opens the app's own link (`claude://code/new`, `codex://threads/new`,
+//! `kimi-code://open`); the app takes it from there, so its usual review and approvals apply.
 
 use std::path::Path;
 
@@ -18,7 +18,58 @@ pub enum Failure {
 }
 
 /// The desktop app each agent runs in.
-pub const APPS: [&str; 2] = ["Claude", "Codex"];
+pub const APPS: [&str; AGENTS] = ["Claude", "Codex", "Kimi"];
+pub const AGENTS: usize = 3;
+
+/// Whether the app's new-task link can carry the text. Kimi Code's cannot.
+pub fn takes_text(agent: usize) -> bool {
+    agent != 2
+}
+
+fn on_path(name: &str, path: &std::ffi::OsStr) -> bool {
+    std::env::split_paths(path).any(|dir| {
+        ["", ".exe", ".cmd"]
+            .iter()
+            .any(|ext| dir.join(format!("{name}{ext}")).is_file())
+    })
+}
+
+fn has_package(packages: &Path, prefix: &str) -> bool {
+    std::fs::read_dir(packages)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+}
+
+/// Which agents are on this machine, as the desktop app or the command line tool. The other
+/// agents do not appear anywhere in Void.
+// shortcut: known install locations only; a Kimi Code installed for all users needs `kimi` on PATH.
+pub fn installed() -> [bool; AGENTS] {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let app = |agent: usize| -> bool {
+        #[cfg(windows)]
+        {
+            let Some(local) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) else {
+                return false;
+            };
+            let packages = local.join("Packages");
+            match agent {
+                0 => has_package(&packages, "Claude_") || local.join("AnthropicClaude").is_dir(),
+                1 => has_package(&packages, "OpenAI.Codex_"),
+                _ => local.join("Programs/Kimi Code/Kimi Code.exe").is_file(),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = has_package;
+            Path::new("/Applications")
+                .join(["Claude.app", "Codex.app", "Kimi Code.app"][agent])
+                .is_dir()
+        }
+    };
+    std::array::from_fn(|agent| app(agent) || on_path(["claude", "codex", "kimi"][agent], &path))
+}
 
 impl Failure {
     pub fn label(&self, agent: usize) -> String {
@@ -86,14 +137,44 @@ fn encode(text: &str) -> String {
     out
 }
 
-/// The app link that opens a new task for agent 0 (Claude) or 1 (Codex).
+/// The app link that opens a new task for agent 0 (Claude), 1 (Codex) or 2 (Kimi Code).
 fn link(agent: usize, project: &Path, prompt: &str) -> String {
     let (text, folder) = (encode(prompt), encode(&project.to_string_lossy()));
-    if agent == 0 {
-        format!("claude://code/new?q={text}&folder={folder}")
-    } else {
-        format!("codex://threads/new?prompt={text}&path={folder}")
+    match agent {
+        0 => format!("claude://code/new?q={text}&folder={folder}"),
+        1 => format!("codex://threads/new?prompt={text}&path={folder}"),
+        _ => format!("kimi-code://open?root={folder}&new=1"),
     }
+}
+
+/// A Codex log is `rollout-<time>-<thread uuid>.jsonl`.
+fn codex_thread(stem: &str) -> Option<&str> {
+    stem.get(stem.len().checked_sub(36)?..)
+}
+
+/// Where a finished turn lives: its own session when the app can link to it, else the app.
+fn finished_link(agent: usize, transcript: &Path) -> String {
+    let stem = transcript
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match agent {
+        0 => crate::projects::desktop_session(&stem)
+            .and_then(|id| session_link(0, &id))
+            .unwrap_or_else(|| "claude://".to_owned()),
+        1 => codex_thread(&stem)
+            .and_then(|id| session_link(1, id))
+            .unwrap_or_else(|| "codex://".to_owned()),
+        _ => match crate::activity::kimi_folder(transcript) {
+            Some(folder) => format!("kimi-code://open?root={}", encode(&folder)),
+            None => "kimi-code://".to_owned(),
+        },
+    }
+}
+
+/// Opens the app where this turn finished.
+pub fn open_finished(agent: usize, transcript: &Path) -> Result<(), Failure> {
+    open(&finished_link(agent, transcript))
 }
 
 /// The app link that opens an existing Claude session or Codex thread. None for an id that
@@ -119,7 +200,7 @@ pub fn open_session(agent: usize, id: &str) -> Result<(), Failure> {
     open(&session_link(agent, id).ok_or(Failure::NoSession)?)
 }
 
-/// Opens a new task for agent 0 (Claude) or 1 (Codex) in its desktop app.
+/// Opens a new task in the agent's desktop app.
 pub fn start(agent: usize, project: &Path, prompt: &str) -> Result<(), Failure> {
     let prompt = check(project, prompt)?;
     open(&link(agent, project, &prompt))
@@ -183,6 +264,30 @@ mod tests {
         assert_eq!(
             check(&here, "  fix the login \n"),
             Ok("fix the login".to_owned())
+        );
+    }
+
+    #[test]
+    fn finds_installed_tools_and_links_finished_turns() {
+        let dir = std::env::temp_dir().join(format!("void-launch-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Claude_abc")).unwrap();
+        std::fs::write(dir.join("kimi.cmd"), "").unwrap();
+        assert!(on_path("kimi", dir.as_os_str()));
+        assert!(!on_path("codex", dir.as_os_str()));
+        assert!(has_package(&dir, "Claude_"));
+        assert!(!has_package(&dir, "OpenAI.Codex_"));
+        let _ = std::fs::remove_dir_all(dir);
+
+        let log =
+            Path::new("rollout-2026-11-08T10-00-00-01a1b232-f6cb-4e0a-9d3c-0123456789ab.jsonl");
+        assert_eq!(
+            finished_link(1, log),
+            "codex://threads/01a1b232-f6cb-4e0a-9d3c-0123456789ab"
+        );
+        assert_eq!(finished_link(1, Path::new("short.jsonl")), "codex://");
+        assert_eq!(
+            link(2, Path::new(r"D:\work\site"), "ignored"),
+            "kimi-code://open?root=D%3A%5Cwork%5Csite&new=1"
         );
     }
 

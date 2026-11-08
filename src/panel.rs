@@ -259,138 +259,183 @@ pub fn row(
 }
 
 /// The one-line answer at the top, built from the same rows so it never disagrees with them.
-fn summary(rows: &[Row; 2]) -> (String, String) {
-    let name = |row: &Row| ["Claude", "Codex"][row.agent];
+fn summary(rows: &[Row]) -> (String, String) {
+    let name = |row: &Row| crate::launch::APPS[row.agent];
     let room = |row: &Row| {
         row.windows
             .iter()
             .filter_map(|window| window.left)
             .fold(f32::INFINITY, f32::min)
     };
-    let (a, b) = (&rows[0], &rows[1]);
-    // What to say about the other agent when this one is the subject.
-    let about = |other: &Row| match other.verdict {
-        Verdict::Ready => {
-            let n = name(other);
-            t!("Працюй у {n}", "Работай в {n}", "Work in {n}")
-        }
-        Verdict::Low => {
-            let n = name(other);
-            t!(
+    if rows.is_empty() {
+        return (
+            s(
+                "Агентів не знайдено",
+                "Агенты не найдены",
+                "No agents found",
+            )
+            .to_owned(),
+            s(
+                "Встанови Claude, Codex або Kimi Code",
+                "Установи Claude, Codex или Kimi Code",
+                "Install Claude, Codex or Kimi Code",
+            )
+            .to_owned(),
+        );
+    }
+    // What to say about the other agents when this one is the subject: the most usable of them.
+    let about = |subject: &Row| {
+        let rank = |row: &Row| match row.verdict {
+            Verdict::Ready => 3,
+            Verdict::Low => 2,
+            Verdict::Unknown => 1,
+            Verdict::Paused => 0,
+        };
+        let Some(other) = rows
+            .iter()
+            .filter(|row| row.agent != subject.agent)
+            .max_by_key(|row| rank(row))
+        else {
+            return String::new();
+        };
+        let n = name(other);
+        match other.verdict {
+            Verdict::Ready => t!("Працюй у {n}", "Работай в {n}", "Work in {n}"),
+            Verdict::Low => t!(
                 "{n}: лишилось мало",
                 "{n}: осталось мало",
                 "{n}: running low"
-            )
-        }
-        _ => {
-            let n = name(other);
-            t!("{n}: немає даних", "{n}: нет данных", "{n}: no data")
+            ),
+            Verdict::Paused => {
+                let at = other.until.clone().unwrap_or_default();
+                t!(
+                    "{n}: пауза до {at}",
+                    "{n}: пауза до {at}",
+                    "{n}: paused until {at}"
+                )
+            }
+            Verdict::Unknown => t!("{n}: немає даних", "{n}: нет данных", "{n}: no data"),
         }
     };
-    match (a.verdict, b.verdict) {
-        (Verdict::Paused, Verdict::Paused) => (
-            s("Обидва на паузі", "Оба на паузе", "Both are paused").to_owned(),
-            t!(
-                "Claude до {} · Codex до {}",
-                "Claude до {} · Codex до {}",
-                "Claude until {} · Codex until {}",
-                a.until.clone().unwrap_or_default(),
-                b.until.clone().unwrap_or_default()
-            ),
-        ),
-        (Verdict::Paused, _) | (_, Verdict::Paused) => {
-            let (paused, other) = if a.verdict == Verdict::Paused {
-                (a, b)
-            } else {
-                (b, a)
-            };
-            let (n, at) = (name(paused), paused.until.clone().unwrap_or_default());
-            (
-                t!(
-                    "{n} на паузі до {at}",
-                    "{n} на паузе до {at}",
-                    "{n} paused until {at}"
-                ),
-                about(other),
-            )
-        }
-        (Verdict::Low, Verdict::Low) => (
-            s(
-                "Обидва майже вичерпано",
-                "Оба почти исчерпаны",
-                "Both are almost out",
-            )
-            .to_owned(),
-            String::new(),
-        ),
-        (Verdict::Low, _) | (_, Verdict::Low) => {
-            let (low, other) = if a.verdict == Verdict::Low {
-                (a, b)
-            } else {
-                (b, a)
-            };
-            let n = name(low);
-            (
-                t!(
-                    "У {n} лишилось мало",
-                    "У {n} осталось мало",
-                    "{n} is running low"
-                ),
-                about(other),
-            )
-        }
-        (Verdict::Ready, Verdict::Ready) => {
-            let detail = if (room(a) - room(b)).abs() >= 0.15 {
-                let n = name(if room(a) > room(b) { a } else { b });
-                t!(
-                    "Більше запасу в {n}",
-                    "Больше запаса в {n}",
-                    "More room in {n}"
-                )
-            } else {
-                String::new()
-            };
-            (
-                s(
-                    "Обидва готові до роботи",
-                    "Оба готовы к работе",
-                    "Both are ready to work",
-                )
-                .to_owned(),
-                detail,
-            )
-        }
-        (Verdict::Ready, Verdict::Unknown) | (Verdict::Unknown, Verdict::Ready) => {
-            let (ready, other) = if a.verdict == Verdict::Ready {
-                (a, b)
-            } else {
-                (b, a)
-            };
-            let n = name(ready);
-            (
-                t!(
-                    "{n} готовий до роботи",
-                    "{n} готов к работе",
-                    "{n} is ready to work"
-                ),
-                about(other),
-            )
-        }
-        (Verdict::Unknown, Verdict::Unknown) => (
+    let all = |verdict: Verdict| rows.iter().all(|row| row.verdict == verdict);
+    let every = |two: &'static str, more: &'static str| if rows.len() == 2 { two } else { more };
+    if all(Verdict::Unknown) {
+        let names = rows.iter().map(name).collect::<Vec<_>>().join(", ");
+        return (
             s(
                 "Поки нічого не бачу",
                 "Пока ничего не вижу",
                 "Nothing to see yet",
             )
             .to_owned(),
-            s(
-                "Попрацюй у Claude Code чи Codex",
-                "Поработай в Claude Code или Codex",
-                "Work in Claude Code or Codex",
-            )
-            .to_owned(),
-        ),
+            t!(
+                "Попрацюй у {names}",
+                "Поработай в {names}",
+                "Work in {names}"
+            ),
+        );
     }
+    if rows.len() > 1 && all(Verdict::Paused) {
+        let until = rows
+            .iter()
+            .map(|row| {
+                let (n, at) = (name(row), row.until.clone().unwrap_or_default());
+                t!("{n} до {at}", "{n} до {at}", "{n} until {at}")
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let title = every(
+            s("Обидва на паузі", "Оба на паузе", "Both are paused"),
+            s("Усі на паузі", "Все на паузе", "All are paused"),
+        );
+        return (title.to_owned(), until);
+    }
+    if rows.len() > 1 && all(Verdict::Low) {
+        let title = every(
+            s(
+                "Обидва майже вичерпано",
+                "Оба почти исчерпаны",
+                "Both are almost out",
+            ),
+            s(
+                "Усі майже вичерпано",
+                "Все почти исчерпаны",
+                "All are almost out",
+            ),
+        );
+        return (title.to_owned(), String::new());
+    }
+    if rows.len() > 1 && all(Verdict::Ready) {
+        let (most, least) = rows
+            .iter()
+            .fold((f32::MIN, f32::MAX), |(most, least), row| {
+                (most.max(room(row)), least.min(room(row)))
+            });
+        let detail = if most - least >= 0.15 {
+            let best = rows
+                .iter()
+                .max_by(|a, b| room(a).total_cmp(&room(b)))
+                .map(name)
+                .unwrap_or_default();
+            t!(
+                "Більше запасу в {best}",
+                "Больше запаса в {best}",
+                "More room in {best}"
+            )
+        } else {
+            String::new()
+        };
+        let title = every(
+            s(
+                "Обидва готові до роботи",
+                "Оба готовы к работе",
+                "Both are ready to work",
+            ),
+            s(
+                "Усі готові до роботи",
+                "Все готовы к работе",
+                "All are ready to work",
+            ),
+        );
+        return (title.to_owned(), detail);
+    }
+    if let Some(paused) = rows.iter().find(|row| row.verdict == Verdict::Paused) {
+        let (n, at) = (name(paused), paused.until.clone().unwrap_or_default());
+        return (
+            t!(
+                "{n} на паузі до {at}",
+                "{n} на паузе до {at}",
+                "{n} paused until {at}"
+            ),
+            about(paused),
+        );
+    }
+    if let Some(low) = rows.iter().find(|row| row.verdict == Verdict::Low) {
+        let n = name(low);
+        return (
+            t!(
+                "У {n} лишилось мало",
+                "У {n} осталось мало",
+                "{n} is running low"
+            ),
+            about(low),
+        );
+    }
+    // At least one is ready and none is low or paused: name the one with the most room.
+    let ready = rows
+        .iter()
+        .filter(|row| row.verdict == Verdict::Ready)
+        .max_by(|a, b| room(a).total_cmp(&room(b)))
+        .unwrap_or(&rows[0]);
+    let n = name(ready);
+    (
+        t!(
+            "{n} готовий до роботи",
+            "{n} готов к работе",
+            "{n} is ready to work"
+        ),
+        about(ready),
+    )
 }
 
 const HEADER: f32 = 62.0;
@@ -416,11 +461,12 @@ fn verdict_color(verdict: Verdict) -> Color32 {
 pub struct Menu {
     pub title: String,
     pub detail: String,
-    pub rows: [Row; 2],
+    /// The agents installed on this machine.
+    pub rows: Vec<Row>,
     pub size: Vec2,
 }
 
-pub fn menu(rows: [Row; 2]) -> Menu {
+pub fn menu(rows: Vec<Row>) -> Menu {
     let (title, detail) = summary(&rows);
     Menu {
         title,
@@ -675,9 +721,15 @@ pub fn draw(
     );
     let action = if *settings_open {
         settings_body(ui, area, settings)
+    } else if menu.rows.is_empty() {
+        None
     } else {
-        // Tabs: one per agent, each with a dot in its status color.
-        *tab = (*tab).min(1);
+        // Tabs: one per installed agent, each with a dot in its status color.
+        let mut chosen = menu
+            .rows
+            .iter()
+            .position(|row| row.agent == *tab)
+            .unwrap_or(0);
         let tabs = Rect::from_min_size(
             Pos2::new(left, area.top() + 4.0),
             Vec2::new(right - left, 32.0),
@@ -687,16 +739,17 @@ pub fn draw(
             .iter()
             .map(|row| {
                 (
-                    ["Claude", "Codex"][row.agent],
+                    crate::launch::APPS[row.agent],
                     Some(verdict_color(row.verdict)),
                 )
             })
             .collect();
-        if let Some(i) = segmented(ui, tabs, "agent-tab", &options, *tab) {
-            *tab = i;
+        if let Some(i) = segmented(ui, tabs, "agent-tab", &options, chosen) {
+            chosen = i;
+            *tab = menu.rows[i].agent;
         }
         // The chosen agent: its status, then its two limits side by side.
-        let row = &menu.rows[*tab];
+        let row = &menu.rows[chosen];
         let y = area.top() + TABS;
         let color = tint(row.agent);
         painter.text(
@@ -853,7 +906,7 @@ pub struct Compose {
     pub open: bool,
     pub agent: usize,
     /// The chosen folder per agent; None means its newest project.
-    pub project: [Option<std::path::PathBuf>; 2],
+    pub project: [Option<std::path::PathBuf>; crate::launch::AGENTS],
     pub text: String,
     /// The last result shown under the field: the message and whether it worked.
     pub note: Option<(String, bool)>,
@@ -862,7 +915,7 @@ pub struct Compose {
     /// Which list is open in place of the field.
     pub picking: Picking,
     /// The existing session chosen per agent; None starts a new one.
-    pub session: [Option<String>; 2],
+    pub session: [Option<String>; crate::launch::AGENTS],
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -1019,8 +1072,14 @@ pub fn compose(
     ui: &mut egui::Ui,
     bottom_right: Pos2,
     state: &mut Compose,
-    projects: &[Vec<crate::projects::Project>; 2],
+    projects: &[Vec<crate::projects::Project>; crate::launch::AGENTS],
+    installed: &[usize],
 ) -> ComposeOut {
+    if let Some(first) = installed.first()
+        && !installed.contains(&state.agent)
+    {
+        state.agent = *first;
+    }
     let size = compose_size();
     let rect = Rect::from_min_max(bottom_right - size, bottom_right);
     let color = tint(state.agent);
@@ -1085,9 +1144,16 @@ pub fn compose(
     }
     // Which agent.
     let switch = Rect::from_min_size(Pos2::new(left, top + 58.0), Vec2::new(right - left, 32.0));
-    let agents = [("Claude", Some(tint(0))), ("Codex", Some(tint(1)))];
-    if let Some(agent) = segmented(ui, switch, "compose-agent", &agents, state.agent) {
-        state.agent = agent;
+    let agents: Vec<(&str, Option<Color32>)> = installed
+        .iter()
+        .map(|&agent| (crate::launch::APPS[agent], Some(tint(agent))))
+        .collect();
+    let chosen = installed
+        .iter()
+        .position(|&agent| agent == state.agent)
+        .unwrap_or(0);
+    if let Some(i) = segmented(ui, switch, "compose-agent", &agents, chosen) {
+        state.agent = installed[i];
         state.note = None;
         state.picking = Picking::Nothing;
     }
@@ -1244,16 +1310,20 @@ pub fn compose(
     let footer = top + 186.0 + FIELD_HEIGHT + 14.0;
     let (message, tone) = match &state.note {
         Some((message, ok)) => (message.clone(), if *ok { READY } else { STOP }),
-        // An open session takes no text through its link, so the text goes to the clipboard.
-        None if thread.is_some() && !state.text.trim().is_empty() => (
-            s(
-                "Текст скопіюється, встав Ctrl+V",
-                "Текст скопируется, вставь Ctrl+V",
-                "Text gets copied, paste with Ctrl+V",
+        // Where the link takes no text, the text goes to the clipboard.
+        None if (thread.is_some() || !crate::launch::takes_text(state.agent))
+            && !state.text.trim().is_empty() =>
+        {
+            (
+                s(
+                    "Текст скопіюється, встав Ctrl+V",
+                    "Текст скопируется, вставь Ctrl+V",
+                    "Text gets copied, paste with Ctrl+V",
+                )
+                .to_owned(),
+                GRAY,
             )
-            .to_owned(),
-            GRAY,
-        ),
+        }
         None if thread.is_some() => (
             s("Enter — відкрити", "Enter — открыть", "Enter to open").to_owned(),
             GRAY,
@@ -1341,18 +1411,18 @@ const PUFF: f32 = 24.0;
 const BUSY_WIDTH: f32 = 236.0;
 const BUSY_ROWS: usize = 3;
 
-/// Soft identity tints, not brand marks: warm for Claude, cool for Codex.
+/// Soft identity tints, not brand marks: warm for Claude, cool for Codex, violet for Kimi.
 pub fn tint(agent: usize) -> Color32 {
-    if agent == 0 {
-        Color32::from_rgb(244, 146, 108)
-    } else {
-        Color32::from_rgb(118, 196, 255)
+    match agent {
+        0 => Color32::from_rgb(244, 146, 108),
+        1 => Color32::from_rgb(118, 196, 255),
+        _ => Color32::from_rgb(186, 160, 255),
     }
 }
 
 fn glyph(agent: usize) -> &'static str {
-    // Generic symbols: a spark for Claude, a prompt chevron for Codex.
-    if agent == 0 { "✳" } else { "❯" }
+    // Generic symbols: a spark for Claude, a prompt chevron for Codex, a moon for Kimi.
+    ["✳", "❯", "☾"][agent]
 }
 
 /// One segment per busy agent inside a single thought bubble above the cat's head.
@@ -1373,6 +1443,8 @@ pub fn bubble_segments(cat: Rect, count: usize) -> Vec<Rect> {
 pub struct Puff {
     pub agent: usize,
     pub sessions: usize,
+    /// Finished rather than working: a check mark instead of the bouncing dots.
+    pub done: bool,
     /// 0..1, eased hover highlight of this segment.
     pub hover: f32,
 }
@@ -1479,20 +1551,35 @@ pub fn thought_bubble(
             strong((12.5 * scale).max(1.0)),
             fade(color),
         );
-        // Three dots bounce in a wave; faster and higher under the pointer.
-        let speed = 6.0 + 4.0 * puff.hover;
-        let jump = 2.5 + 1.5 * puff.hover;
-        for k in 0..3 {
-            let bounce = time.map_or(0.0, |_| (t * speed - k as f32 * 0.9).sin().max(0.0) * jump);
-            let p = Pos2::new(
-                seg.left() + (26.0 + k as f32 * 6.0) * scale,
-                seg.center().y - bounce,
-            );
-            painter.circle_filled(
-                p,
-                1.9 * scale,
-                fade(color.gamma_multiply(0.55 + 0.45 * (bounce / jump))),
-            );
+        if puff.done {
+            let x = seg.left() + 26.0 * scale;
+            let y = seg.center().y;
+            let points = [
+                Pos2::new(x, y),
+                Pos2::new(x + 4.0 * scale, y + 4.0 * scale),
+                Pos2::new(x + 12.0 * scale, y - 4.5 * scale),
+            ];
+            painter.add(Shape::line(
+                points.to_vec(),
+                Stroke::new(2.0 * scale, fade(READY)),
+            ));
+        } else {
+            // Three dots bounce in a wave; faster and higher under the pointer.
+            let speed = 6.0 + 4.0 * puff.hover;
+            let jump = 2.5 + 1.5 * puff.hover;
+            for k in 0..3 {
+                let bounce =
+                    time.map_or(0.0, |_| (t * speed - k as f32 * 0.9).sin().max(0.0) * jump);
+                let p = Pos2::new(
+                    seg.left() + (26.0 + k as f32 * 6.0) * scale,
+                    seg.center().y - bounce,
+                );
+                painter.circle_filled(
+                    p,
+                    1.9 * scale,
+                    fade(color.gamma_multiply(0.55 + 0.45 * (bounce / jump))),
+                );
+            }
         }
         if puff.sessions > 1 {
             let badge = Pos2::new(seg.right() - 2.0, seg.top() + 1.0);
@@ -1560,7 +1647,7 @@ pub fn busy_card(
     now: u64,
     time: Option<f64>,
 ) {
-    let name = ["Claude", "Codex"][agent];
+    let name = crate::launch::APPS[agent];
     let color = tint(agent);
     glass(painter, rect, Some(color));
     let (left, right) = (rect.left() + 16.0, rect.right() - 16.0);
@@ -1658,9 +1745,118 @@ pub fn busy_card(
     );
 }
 
+pub fn done_card_size(done: &[crate::activity::Done]) -> Vec2 {
+    Vec2::new(
+        BUSY_WIDTH,
+        40.0 + done.len().min(BUSY_ROWS) as f32 * SESSION_ROW + 34.0,
+    )
+}
+
+/// What just finished: the project, how long ago, and the task it was given.
+pub fn done_card(
+    painter: &egui::Painter,
+    rect: Rect,
+    agent: usize,
+    done: &[crate::activity::Done],
+    now: u64,
+) {
+    let name = crate::launch::APPS[agent];
+    let color = tint(agent);
+    glass(painter, rect, Some(color));
+    let (left, right) = (rect.left() + 16.0, rect.right() - 16.0);
+    let mut y = rect.top() + 14.0;
+    painter.circle_filled(Pos2::new(left + 4.0, y + 9.0), 3.5, READY);
+    painter.text(
+        Pos2::new(left + 14.0, y),
+        egui::Align2::LEFT_TOP,
+        t!("{name} завершив", "{name} закончил", "{name} finished"),
+        strong(13.5),
+        LABEL,
+    );
+    y += 30.0;
+    let line = |y: f32, text: String, font: egui::FontId, color: Color32, room: f32| {
+        // One line only: the width cuts long names and tasks, never wraps them.
+        let galley = painter.layout_no_wrap(text, font, color);
+        let height = galley.size().y;
+        painter
+            .with_clip_rect(Rect::from_min_size(
+                Pos2::new(left, y),
+                Vec2::new(room, height),
+            ))
+            .galley(Pos2::new(left, y), galley, color);
+    };
+    for item in done.iter().take(BUSY_ROWS) {
+        let since = painter.layout_no_wrap(ago(item.end, now), regular(11.0), SECONDARY);
+        let room = right - left - since.size().x - 10.0;
+        let project = if item.project.is_empty() {
+            s("Без назви", "Без названия", "Untitled").to_owned()
+        } else {
+            item.project.clone()
+        };
+        line(y, project, strong(12.0), LABEL, room);
+        painter.galley(Pos2::new(right - since.size().x, y + 1.0), since, SECONDARY);
+        let task = item.prompt.as_deref().map_or_else(
+            || s("Завдання виконано", "Задача выполнена", "Task complete").to_owned(),
+            |prompt| prompt.split_whitespace().collect::<Vec<_>>().join(" "),
+        );
+        line(y + 18.0, task, regular(10.5), SECONDARY, right - left);
+        y += SESSION_ROW;
+    }
+    painter.line_segment(
+        [Pos2::new(left, y + 2.0), Pos2::new(right, y + 2.0)],
+        Stroke::new(1.0, Color32::from_white_alpha(20)),
+    );
+    painter.text(
+        Pos2::new(left, y + 9.0),
+        egui::Align2::LEFT_TOP,
+        t!(
+            "Натисни, щоб відкрити {name}",
+            "Нажми, чтобы открыть {name}",
+            "Click to open {name}"
+        ),
+        regular(10.5),
+        SECONDARY,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_summary_handles_one_three_and_no_agents() {
+        let now = 1_800_000_000;
+        let make = |agent: usize, used: Option<f64>| {
+            let records = used.map_or_else(Vec::new, |used| limits(used, used, now));
+            row(
+                agent,
+                &advice::assess(&records, now),
+                &records,
+                None,
+                [None, None],
+                now,
+                0,
+            )
+        };
+        assert_eq!(summary(&[]).0, "Агентів не знайдено");
+        let (title, detail) = summary(&[make(2, Some(10.0))]);
+        assert_eq!(
+            (title.as_str(), detail.as_str()),
+            ("Kimi готовий до роботи", "")
+        );
+        let all = [
+            make(0, Some(10.0)),
+            make(1, Some(70.0)),
+            make(2, Some(20.0)),
+        ];
+        let (title, detail) = summary(&all);
+        assert_eq!(title, "Усі готові до роботи");
+        assert_eq!(detail, "Більше запасу в Claude");
+        let mixed = [make(0, None), make(1, Some(95.0)), make(2, Some(20.0))];
+        let (title, detail) = summary(&mixed);
+        assert_eq!(title, "У Codex лишилось мало");
+        assert_eq!(detail, "Працюй у Kimi");
+    }
 
     #[test]
     fn busy_card_words_read_naturally() {

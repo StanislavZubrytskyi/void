@@ -43,9 +43,96 @@ fn same_path(a: &Path, b: &Path) -> bool {
     norm(a) == norm(b)
 }
 
-/// Projects of agent 0 (Claude Desktop) or 1 (Codex), as the app lists them.
+/// Projects of agent 0 (Claude Desktop), 1 (Codex) or 2 (Kimi Code), as the app lists them.
 pub fn list(agent: usize) -> Vec<Project> {
-    if agent == 0 { claude() } else { codex() }
+    match agent {
+        0 => claude(),
+        1 => codex(),
+        _ => kimi(),
+    }
+}
+
+/// Kimi Code's workspaces, the last opened first. It has no link to a given session, so its
+/// sessions are not offered.
+fn kimi() -> Vec<Project> {
+    let Some(home) = crate::kimi::home() else {
+        return Vec::new();
+    };
+    let model = std::fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|config| kimi_model(&config));
+    std::fs::read(home.join("workspaces.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .map(|state| kimi_projects(&state, model))
+        .unwrap_or_default()
+}
+
+/// The display name of the default model, from the app's TOML config.
+fn kimi_model(config: &str) -> Option<String> {
+    let id = crate::kimi::config_value(config, "default_model")?;
+    let header = format!("[models.\"{id}\"]");
+    let section = &config[config.find(&header)? + header.len()..];
+    let section = section.split("\n[").next()?;
+    crate::kimi::config_value(section, "display_name")
+}
+
+fn kimi_projects(state: &Value, model: Option<String>) -> Vec<Project> {
+    let deleted = state.get("deleted_workspace_ids").and_then(Value::as_array);
+    let mut rows: Vec<(&str, Project)> = state
+        .get("workspaces")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(id, _)| {
+            !deleted.is_some_and(|list| list.iter().any(|item| item.as_str() == Some(id.as_str())))
+        })
+        .filter_map(|(_, workspace)| {
+            let path = PathBuf::from(workspace.get("root")?.as_str()?);
+            let opened = workspace.get("last_opened_at")?.as_str()?;
+            let name = workspace.get("name")?.as_str()?.to_owned();
+            Some((
+                opened,
+                Project {
+                    path,
+                    name,
+                    preferred: false,
+                    model: model.clone(),
+                    sessions: Vec::new(),
+                },
+            ))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(a.0)); // ISO timestamps sort as text
+    if let Some((_, first)) = rows.first_mut() {
+        first.preferred = true;
+    }
+    rows.into_iter().map(|(_, project)| project).collect()
+}
+
+/// The Claude Desktop session behind a Claude Code transcript, if it was started there.
+pub fn desktop_session(cli_session: &str) -> Option<String> {
+    fn find(dir: &Path, depth: u8, cli_session: &str) -> Option<String> {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() && depth > 0 {
+                if let Some(found) = find(&path, depth - 1, cli_session) {
+                    return Some(found);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "json")
+                && let Some(session) = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                && session.get("cliSessionId").and_then(Value::as_str) == Some(cli_session)
+            {
+                return session.get("sessionId")?.as_str().map(str::to_owned);
+            }
+        }
+        None
+    }
+    claude_data_dirs()
+        .iter()
+        .find_map(|dir| find(&dir.join("claude-code-sessions"), 3, cli_session))
 }
 
 /// "claude-opus-5-5" reads as "Opus 5.5".
@@ -379,6 +466,27 @@ fn codex_projects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kimi_workspaces_newest_first_without_deleted_ones() {
+        let state = serde_json::json!({
+            "workspaces": {
+                "a": {"root": "D:\\a", "name": "A", "last_opened_at": "2026-11-01T00:00:00Z"},
+                "b": {"root": "D:\\b", "name": "B", "last_opened_at": "2026-11-08T00:00:00Z"},
+                "c": {"root": "D:\\c", "name": "C", "last_opened_at": "2026-11-09T00:00:00Z"}
+            },
+            "deleted_workspace_ids": ["c"]
+        });
+        let list = kimi_projects(&state, Some("K3".into()));
+        assert_eq!(
+            list.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["B", "A"]
+        );
+        assert!(list[0].preferred && !list[1].preferred);
+        assert_eq!(list[0].model.as_deref(), Some("K3"));
+        let config = "default_model = \"k/two\"\n[models.\"k/one\"]\ndisplay_name = \"One\"\n[models.\"k/two\"]\nprovider = \"k\"\ndisplay_name = \"Two\"\n";
+        assert_eq!(kimi_model(config).as_deref(), Some("Two"));
+    }
 
     #[test]
     fn model_ids_read_like_the_app() {

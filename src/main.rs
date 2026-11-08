@@ -7,6 +7,7 @@ mod advice;
 mod claude;
 mod codex;
 mod estimate;
+mod kimi;
 mod launch;
 mod panel;
 mod pet;
@@ -77,14 +78,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     usage::now().saturating_sub(row.time)
                 );
             }
-            let [busy_claude, busy_codex] = activity::scan();
+            let [busy_claude, busy_codex, busy_kimi] = activity::scan();
             println!(
-                "Working now: Claude {}, Codex {}",
+                "Working now: Claude {}, Codex {}, Kimi {}",
                 busy_claude.len(),
-                busy_codex.len()
+                busy_codex.len(),
+                busy_kimi.len()
             );
+            println!("Installed (Claude, Codex, Kimi): {:?}", launch::installed());
             println!("Finished turns remembered: {}", turns::load().len());
-            for (agent, name) in ["Claude", "Codex"].into_iter().enumerate() {
+            for (agent, name) in launch::APPS.into_iter().enumerate() {
                 let found = projects::list(agent);
                 let names: Vec<String> = found
                     .iter()
@@ -104,6 +107,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "unavailable"
                 }
             );
+            println!(
+                "Kimi account limits: {}",
+                if kimi::account_sample().is_some() {
+                    "available"
+                } else {
+                    "waiting for a live Kimi Code login"
+                }
+            );
+            println!("Kimi quota samples: {}", usage::kimi_history().len());
             Ok(())
         }
         Some("--watch-check") => {
@@ -129,21 +141,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("Codex connected: {online}");
                             }
                         }
-                        runtime::Update::Activity([claude, codex]) => {
+                        runtime::Update::Kimi(rows) => {
+                            println!("Kimi quota samples: {}", rows.len());
+                        }
+                        runtime::Update::Installed(found) => {
+                            println!("Installed (Claude, Codex, Kimi): {found:?}");
+                        }
+                        runtime::Update::Activity([claude, codex, kimi]) => {
                             println!(
-                                "Working now: Claude {}, Codex {}",
+                                "Working now: Claude {}, Codex {}, Kimi {}",
                                 claude.len(),
-                                codex.len()
+                                codex.len(),
+                                kimi.len()
                             );
                         }
-                        runtime::Update::Finished(agent) => {
-                            println!("Turn finished: {}", ["Claude", "Codex"][agent]);
+                        runtime::Update::Finished(done) => {
+                            println!("Turn finished: {}", launch::APPS[done.agent]);
                         }
-                        runtime::Update::Projects([claude, codex]) => {
+                        runtime::Update::Projects([claude, codex, kimi]) => {
                             println!(
-                                "Recent projects: Claude {}, Codex {}",
+                                "Recent projects: Claude {}, Codex {}, Kimi {}",
                                 claude.len(),
-                                codex.len()
+                                codex.len(),
+                                kimi.len()
                             );
                         }
                         runtime::Update::Tokens(agent, minutes) => {
@@ -157,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
                             println!(
                                 "{} tokens: {} in 5 h, {} in 7 days",
-                                ["Claude", "Codex"][agent],
+                                launch::APPS[agent],
                                 sum(5 * 3600),
                                 sum(7 * 86_400)
                             );
@@ -233,6 +253,12 @@ fn desktop(demo: bool) -> Result<(), Box<dyn std::error::Error>> {
                 records: Vec::new(),
                 measured: Vec::new(),
                 codex_records: Vec::new(),
+                kimi_records: Vec::new(),
+                installed: if demo {
+                    [true; launch::AGENTS]
+                } else {
+                    launch::installed()
+                },
                 feed: (!demo).then(|| runtime::start(cc.egui_ctx.clone())),
                 claude_accounts: Vec::new(),
                 claude_failure: None,
@@ -260,7 +286,7 @@ fn desktop(demo: bool) -> Result<(), Box<dyn std::error::Error>> {
                 positioned: false,
                 offset: advice::utc_offset(),
                 notified: HashSet::new(),
-                blocked_before: [None; 2],
+                blocked_before: [None; launch::AGENTS],
                 busy: Busy {
                     sessions: if demo {
                         demo_busy(usage::now())
@@ -270,6 +296,7 @@ fn desktop(demo: bool) -> Result<(), Box<dyn std::error::Error>> {
                     hover: None,
                     shown: None,
                     away: None,
+                    done: Default::default(),
                     reduced: std::env::var_os("VOID_REDUCED_MOTION").is_some(),
                 },
             }))
@@ -286,6 +313,9 @@ struct Companion {
     records: Vec<Record>,
     measured: Vec<Record>,
     codex_records: Vec<Record>,
+    kimi_records: Vec<Record>,
+    /// Which agents are on this machine; the rest appear nowhere.
+    installed: [bool; launch::AGENTS],
     feed: Option<std::sync::mpsc::Receiver<runtime::Update>>,
     claude_accounts: Vec<Record>,
     claude_failure: Option<claude::Failure>,
@@ -314,10 +344,10 @@ struct Companion {
     compose_away: Option<f64>,
     /// After a task starts, the confirmation stays this long, then the composer closes.
     compose_close_at: Option<f64>,
-    /// Recent project folders: Claude, then Codex.
-    projects: [Vec<projects::Project>; 2],
-    /// Tokens per minute over the last eight days: Claude, then Codex.
-    tokens: [Vec<(u64, u64)>; 2],
+    /// Recent project folders per agent.
+    projects: [Vec<projects::Project>; launch::AGENTS],
+    /// Tokens per minute over the last eight days, per agent.
+    tokens: [Vec<(u64, u64)>; launch::AGENTS],
     open_size: Vec2,
     /// Where the cat's bottom-right corner lives when nothing is open.
     home: Option<Pos2>,
@@ -326,15 +356,22 @@ struct Companion {
     positioned: bool,
     offset: i64,
     notified: HashSet<(String, u64)>,
-    blocked_before: [Option<u64>; 2],
+    blocked_before: [Option<u64>; launch::AGENTS],
     busy: Busy,
     settings: settings::Settings,
 }
 
-/// Working sessions above the closed cat: Claude, then Codex.
+/// A finished turn's badge goes away after this long if nobody clicks it.
+const DONE_KEEP: u64 = 3600;
+/// Turns remembered per agent for the badge's card.
+const DONE_SHOWN: usize = 3;
+
+/// Working sessions and just-finished turns above the closed cat, per agent.
 #[derive(Default)]
 struct Busy {
-    sessions: [Vec<activity::Session>; 2],
+    sessions: [Vec<activity::Session>; launch::AGENTS],
+    /// Finished turns not looked at yet, newest first.
+    done: [Vec<activity::Done>; launch::AGENTS],
     /// The agent whose bubble segment (or its card) is under the pointer.
     hover: Option<usize>,
     /// When the bubble appeared, for its pop-in.
@@ -354,11 +391,16 @@ impl Busy {
         ctx: &egui::Context,
         bounds: egui::Rect,
         cat: egui::Rect,
-        records: [&[Record]; 2],
+        records: [&[Record]; launch::AGENTS],
+        installed: [bool; launch::AGENTS],
         now: u64,
         offset: i64,
     ) -> (Vec2, Option<usize>) {
-        let agents: Vec<usize> = (0..2).filter(|i| !self.sessions[*i].is_empty()).collect();
+        let agents: Vec<usize> = (0..launch::AGENTS)
+            .filter(|i| {
+                installed[*i] && !(self.sessions[*i].is_empty() && self.done[*i].is_empty())
+            })
+            .collect();
         if agents.is_empty() {
             self.hover = None;
             self.shown = None;
@@ -403,12 +445,15 @@ impl Busy {
             self.away = None;
         }
         self.hover = hover;
-        let time = (!self.reduced).then_some(clock);
+        // A finished badge holds still; only working agents and the pop-in animate.
+        let working = agents.iter().any(|i| !self.sessions[*i].is_empty());
+        let time = (!self.reduced && working).then_some(clock);
         let puffs: Vec<panel::Puff> = agents
             .iter()
             .map(|&agent| panel::Puff {
                 agent,
-                sessions: self.sessions[agent].len(),
+                done: self.sessions[agent].is_empty(),
+                sessions: self.sessions[agent].len().max(self.done[agent].len()),
                 hover: ctx.animate_bool_with_time(
                     ui.id().with(("busy-hover", agent)),
                     hover == Some(agent),
@@ -422,18 +467,23 @@ impl Busy {
             ((clock - shown) / 0.45).min(1.0) as f32
         };
         panel::thought_bubble(ui.painter(), cat, &segments, &puffs, appear, time);
-        if time.is_some() {
+        if time.is_some() || (!self.reduced && clock - shown < 0.5) {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
-        // Two agents need a little room left of the cat for the wider bubble.
+        // More agents need room left of the cat for the wider bubble.
         let closed = Vec2::new(
-            if agents.len() > 1 { 120.0 } else { 96.0 },
+            [96.0, 96.0, 120.0, 168.0][agents.len()],
             88.0 + panel::STRIP,
         );
         let Some(agent) = hover else {
             return (closed, clicked);
         };
-        let size = panel::busy_card_size(&self.sessions[agent]);
+        let finished = self.sessions[agent].is_empty();
+        let size = if finished {
+            panel::done_card_size(&self.done[agent])
+        } else {
+            panel::busy_card_size(&self.sessions[agent])
+        };
         let window = Vec2::new(
             (size.x + panel::MARGIN * 2.0).max(closed.x),
             88.0 + panel::STRIP + 6.0 + size.y + panel::MARGIN,
@@ -447,15 +497,19 @@ impl Busy {
                 ),
                 size,
             );
-            panel::busy_card(
-                ui.painter(),
-                card,
-                agent,
-                &self.sessions[agent],
-                &panel::quotas(records[agent], now, offset),
-                now,
-                time,
-            );
+            if finished {
+                panel::done_card(ui.painter(), card, agent, &self.done[agent], now);
+            } else {
+                panel::busy_card(
+                    ui.painter(),
+                    card,
+                    agent,
+                    &self.sessions[agent],
+                    &panel::quotas(records[agent], now, offset),
+                    now,
+                    time,
+                );
+            }
         }
         (window, clicked)
     }
@@ -526,13 +580,25 @@ impl eframe::App for Companion {
                         self.codex_records = rows;
                         self.codex_online = online;
                     }
-                    runtime::Update::Activity(sessions) => self.busy.sessions = sessions,
+                    runtime::Update::Kimi(rows) => self.kimi_records = rows,
+                    runtime::Update::Installed(found) => self.installed = found,
+                    runtime::Update::Activity(sessions) => {
+                        // Back at work in that session: its old result is no longer news.
+                        for (done, busy) in self.busy.done.iter_mut().zip(&sessions) {
+                            done.retain(|item| !busy.iter().any(|session| session.id == item.id));
+                        }
+                        self.busy.sessions = sessions;
+                    }
                     runtime::Update::Tokens(agent, minutes) => self.tokens[agent] = minutes,
                     runtime::Update::Projects(found) => self.projects = found,
-                    runtime::Update::Finished(_) => {
+                    runtime::Update::Finished(done) => {
                         if self.settings.sound {
                             sound::play();
                         }
+                        let list = &mut self.busy.done[done.agent];
+                        list.retain(|item| item.id != done.id);
+                        list.insert(0, done);
+                        list.truncate(DONE_SHOWN);
                     }
                 }
             }
@@ -550,17 +616,22 @@ impl eframe::App for Companion {
                     && a.sample.prompt_id == b.sample.prompt_id
             });
         }
-        let claude = self.measured.as_slice();
-        let claude_status = advice::assess(claude, time);
-        let codex_status = advice::assess(&self.codex_records, time);
+        for list in &mut self.busy.done {
+            list.retain(|item| time.saturating_sub(item.end) <= DONE_KEEP);
+        }
+        let installed = self.installed;
+        // An agent that is not on this machine has no data, so it can raise no alert either.
+        let sources: [&[Record]; launch::AGENTS] =
+            [&self.measured, &self.codex_records, &self.kimi_records];
+        let data: [&[Record]; launch::AGENTS] =
+            std::array::from_fn(|i| if installed[i] { sources[i] } else { &[] });
+        let statuses: [Status; launch::AGENTS] = data.map(|records| advice::assess(records, time));
+        let agents_here: Vec<usize> = (0..launch::AGENTS).filter(|i| installed[*i]).collect();
         if !self.demo {
             let messages = alerts(
                 &mut self.notified,
                 &mut self.blocked_before,
-                [
-                    ("Claude", &claude_status, claude),
-                    ("Codex", &codex_status, &self.codex_records),
-                ],
+                std::array::from_fn(|i| (launch::APPS[i], &statuses[i], data[i])),
                 time,
                 self.offset,
             );
@@ -573,7 +644,7 @@ impl eframe::App for Companion {
             #[cfg(not(windows))]
             let _ = messages; // shortcut: notifications are Windows-only until the macOS and Linux builds ship.
         }
-        let asleep = asleep([&claude_status, &codex_status]);
+        let asleep = asleep(statuses.each_ref());
         // Awake while an agent works, or while someone is looking at it; asleep when nothing runs.
         let working = self.busy.sessions.iter().any(|list| !list.is_empty());
 
@@ -593,7 +664,12 @@ impl eframe::App for Companion {
                 if !on_cat {
                     self.compose_rearm = false;
                 }
-                if !self.details && !working && !self.compose.open && on_cat && !self.compose_rearm
+                if !self.details
+                    && !working
+                    && !self.compose.open
+                    && on_cat
+                    && !self.compose_rearm
+                    && !agents_here.is_empty()
                 {
                     let since = *self.compose_hover.get_or_insert(clock);
                     if clock - since >= COMPOSE_DWELL {
@@ -608,30 +684,35 @@ impl eframe::App for Companion {
                     self.compose_hover = None;
                 }
                 let window = if self.details {
-                    let menu = panel::menu([
-                        panel::row(
-                            0,
-                            &claude_status,
-                            claude,
-                            self.claude_failure.map(|failure| failure.label()),
-                            spent(&self.tokens[0], claude, time),
-                            time,
-                            self.offset,
-                        ),
-                        panel::row(
-                            1,
-                            &codex_status,
-                            &self.codex_records,
-                            (!self.codex_online).then_some(i18n::s(
-                                "Немає зв’язку · повторюю підключення",
-                                "Нет связи · переподключаюсь",
-                                "No connection · reconnecting",
-                            )),
-                            spent(&self.tokens[1], &self.codex_records, time),
-                            time,
-                            self.offset,
-                        ),
-                    ]);
+                    let menu = panel::menu(
+                        agents_here
+                            .iter()
+                            .map(|&i| {
+                                let unavailable = match i {
+                                    0 => self.claude_failure.map(|failure| failure.label()),
+                                    1 => (!self.codex_online).then_some(i18n::s(
+                                        "Немає зв’язку · повторюю підключення",
+                                        "Нет связи · переподключаюсь",
+                                        "No connection · reconnecting",
+                                    )),
+                                    _ => Some(i18n::s(
+                                        "Оновиться під час роботи в Kimi",
+                                        "Обновится во время работы в Kimi",
+                                        "Updates while Kimi is working",
+                                    )),
+                                };
+                                panel::row(
+                                    i,
+                                    &statuses[i],
+                                    data[i],
+                                    unavailable,
+                                    spent(&self.tokens[i], data[i], time),
+                                    time,
+                                    self.offset,
+                                )
+                            })
+                            .collect(),
+                    );
                     let window = panel::window_size(&menu);
                     if bounds.width() >= window.x - 0.5 && bounds.height() >= window.y - 0.5 {
                         let (area, action) = panel::draw(
@@ -671,6 +752,7 @@ impl eframe::App for Companion {
                             egui::pos2(bounds.right() - panel::MARGIN, cat_rect.top() + 4.0),
                             &mut self.compose,
                             &self.projects,
+                            &agents_here,
                         );
                         self.compose_area = Some([out.area, cat_rect]);
                         self.compose_typing = out.typing;
@@ -681,9 +763,16 @@ impl eframe::App for Companion {
                             let agent = self.compose.agent;
                             let app = launch::APPS[agent];
                             let text = self.compose.text.trim().to_owned();
+                            // A sleeping app can hold the link call for seconds; the note's time
+                            // starts after it.
+                            let opening = std::time::Instant::now();
                             let result = match &send {
                                 panel::Send::New(folder) => launch::start(agent, folder, &text)
                                     .map(|()| {
+                                        if !launch::takes_text(agent) {
+                                            ctx.copy_text(text.clone());
+                                            return s_paste();
+                                        }
                                         let project =
                                             activity::folder_name(&folder.to_string_lossy());
                                         t!(
@@ -712,7 +801,8 @@ impl eframe::App for Companion {
                                 Ok(message) => {
                                     self.compose.note = Some((message, true));
                                     self.compose.text.clear();
-                                    self.compose_close_at = Some(clock + 1.8);
+                                    self.compose_close_at =
+                                        Some(clock + 1.8 + opening.elapsed().as_secs_f64());
                                 }
                                 Err(failure) => {
                                     self.compose.note = Some((failure.label(agent), false));
@@ -727,15 +817,25 @@ impl eframe::App for Companion {
                         ctx,
                         bounds,
                         cat_rect,
-                        [claude, &self.codex_records],
+                        data,
+                        installed,
                         time,
                         self.offset,
                     );
                     if let Some(agent) = clicked {
-                        // A click on the bubble opens the menu on that agent.
-                        self.menu_tab = agent;
-                        self.details = true;
-                        self.settings_open = false;
+                        // A finished badge opens the app there; a working one, the menu.
+                        match self.busy.done[agent].first() {
+                            Some(done) if self.busy.sessions[agent].is_empty() => {
+                                if launch::open_finished(agent, &done.id).is_ok() {
+                                    self.busy.done[agent].clear();
+                                }
+                            }
+                            _ => {
+                                self.menu_tab = agent;
+                                self.details = true;
+                                self.settings_open = false;
+                            }
+                        }
                         ctx.request_repaint();
                     }
                     window
@@ -791,7 +891,8 @@ impl eframe::App for Companion {
                     cat.hovered(),
                 );
                 self.pet.draw(ui, cat_rect, awake);
-                if !awake {
+                // The z letters and a finished badge would share the same spot above the head.
+                if !awake && self.busy.done.iter().all(Vec::is_empty) {
                     let time = (!self.busy.reduced).then(|| ui.input(|input| input.time));
                     panel::sleep_zs(ui.painter(), cat_rect, time);
                 }
@@ -814,6 +915,7 @@ impl eframe::App for Companion {
                 || self.compose_away.is_some_and(|since| clock - since >= 1.2)
                 || self.compose_close_at.is_some_and(|at| clock >= at)
                 || self.details
+                || agents_here.is_empty()
                 || (working && empty);
             if close {
                 self.compose.open = false;
@@ -909,17 +1011,17 @@ fn cat_awake(blocked: bool, working: bool, details: bool, hovered: bool) -> bool
 }
 
 /// Every agent with data is blocked: nothing can run, so the cat rests.
-fn asleep(agents: [&Status; 2]) -> bool {
+fn asleep<const N: usize>(agents: [&Status; N]) -> bool {
     let known: Vec<_> = agents.iter().filter(|s| s.used.is_some()).collect();
     !known.is_empty() && known.iter().all(|s| s.tone == Tone::Blocked)
 }
 
 /// Three notifications, each at most once per window: 30 minutes left, access is back,
 /// and 80% of the week gone with more than two days to go.
-fn alerts(
+fn alerts<const N: usize>(
     notified: &mut HashSet<(String, u64)>,
-    blocked_before: &mut [Option<u64>; 2],
-    agents: [(&str, &Status, &[Record]); 2],
+    blocked_before: &mut [Option<u64>; N],
+    agents: [(&str, &Status, &[Record]); N],
     time: u64,
     offset: i64,
 ) -> Vec<(String, String)> {
@@ -1054,7 +1156,7 @@ fn demo_codex_history(time: u64) -> Vec<Record> {
     }).collect()
 }
 
-fn demo_busy(time: u64) -> [Vec<activity::Session>; 2] {
+fn demo_busy(time: u64) -> [Vec<activity::Session>; launch::AGENTS] {
     let session = |project: &str, minutes: u64, tool: Option<&str>| activity::Session {
         id: project.into(),
         project: project.into(),
@@ -1071,6 +1173,7 @@ fn demo_busy(time: u64) -> [Vec<activity::Session>; 2] {
             session("demo-bot", 3, None),
         ],
         vec![session("demo-api", 7, Some("shell"))],
+        Vec::new(),
     ]
 }
 
